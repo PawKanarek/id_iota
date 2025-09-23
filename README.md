@@ -32,7 +32,9 @@ streamlit run app.py
 
 The app will open at [http://localhost:8501](http://localhost:8501).
 
-### 4) Use it
+### 3) ????
+
+### 4) Profit
 
 * Drag & drop your `.log` files into the sidebar and click **Load uploaded logs**.
 * Explore **Backward passes**, **Loss**, and **Exceptions**; toggle **anti-doxx** if needed.
