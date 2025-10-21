@@ -7,6 +7,7 @@ from pathlib import Path
 def get_connection(db_path: Path | str) -> sqlite3.Connection:
     """
     Create a SQLite connection with sensible defaults.
+    Uses disk-based database for better memory efficiency.
     """
     conn = sqlite3.connect(
         str(db_path),
@@ -14,6 +15,10 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+    # Performance optimizations for disk-based DB
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
     return conn
 
 

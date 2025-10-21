@@ -3,17 +3,22 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import shutil
+import tempfile
+import atexit
+import zipfile
+import io
 from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from bisect import bisect_left
-from minerlogs.timeutil import parse_log_datetime  # reuse your parser
+from minerlogs.timeutil import parse_log_datetime
 
-# Local modules
-from minerlogs.db import ensure_schema
+from minerlogs.db import ensure_schema, get_connection
 from minerlogs.ingest import ingest_uploaded_files
 from minerlogs.queries import (
     list_miners,
@@ -37,10 +42,17 @@ HEADER_RX = re.compile(
 def _ts_key(dt) -> tuple[int, int, int, int, int, int, int]:
     return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond)
 
-def _build_header_indices(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _load_file_lines(filepath: Path) -> List[str]:
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+def _build_header_indices(file_paths: List[Path]) -> List[Dict[str, Any]]:
     idx_list = []
-    for f in files:
-        lines = f.get("lines", [])
+    for fpath in file_paths:
+        lines = _load_file_lines(fpath)
         keys, levels, line_idx = [], [], []
         for i, line in enumerate(lines):
             m = HEADER_RX.match(line)
@@ -53,100 +65,182 @@ def _build_header_indices(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             levels.append(m.group("level"))
             line_idx.append(i)
         idx_list.append({
-            "name": f.get("name", "unknown"),
-            "lines": lines,
+            "name": fpath.name,
+            "path": fpath,
             "keys": keys,
             "levels": levels,
             "line_idx": line_idx,
         })
     return idx_list
 
-def _ensure_index() -> None:
-    """Build the per-file timestamp index only when needed (or when files change)."""
-    files = st.session_state.get("uploaded_texts", [])
-    fp = tuple((f.get("name"), len(f.get("lines", []))) for f in files)
-    if st.session_state.get("index_fingerprint") == fp and st.session_state.get("uploaded_index"):
-        return
-    with st.spinner("Indexing log headers for fast reporting…"):
-        st.session_state["uploaded_index"] = _build_header_indices(files)
-        st.session_state["index_fingerprint"] = fp
-    
-    
 def _find_exception_line_and_context(
     ts_local: pd.Timestamp,
     level: str,
     message: str,
-    files: List[Dict[str, Any]],
+    file_paths: List[Path],
     pre_lines: int = 100,
     post_lines: int = 25,
 ) -> Tuple[Optional[str], List[str], List[str]]:
-    # Fast path with index
-    idx_pack = st.session_state.get("uploaded_index", [])
-    if idx_pack:
-        key = _ts_key(ts_local.to_pydatetime())
-        msg_prefix = (message or "").strip()[:80]
-        for idxf in idx_pack:
-            keys = idxf["keys"]
-            if not keys:
-                continue
-            pos = bisect_left(keys, key)
-            start = max(0, pos - 3)
-            stop = min(len(keys), pos + 4)
-            for j in range(start, stop):
-                if keys[j] != key or idxf["levels"][j] != level:
-                    continue
-                li = idxf["line_idx"][j]
-                line = idxf["lines"][li]
-                if msg_prefix and msg_prefix not in line:
-                    continue
-                s = max(0, li - pre_lines)
-                e = min(len(idxf["lines"]), li + 1 + post_lines)
-                return idxf["name"], idxf["lines"][s:li], idxf["lines"][li:e]
-
-    # Slow fallback (rare)
-    rx = _ts_regex_for_line(ts_local, level)
+    if "report_index" not in st.session_state:
+        with st.spinner("Indexing log files for context extraction..."):
+            st.session_state["report_index"] = _build_header_indices(file_paths)
+    
+    idx_pack = st.session_state.get("report_index", [])
+    key = _ts_key(ts_local.to_pydatetime())
     msg_prefix = (message or "").strip()[:80]
-    msg_prefix_esc = re.escape(msg_prefix) if msg_prefix else None
-    for f in files:
-        lines = f.get("lines", [])
-        if not lines:
+    
+    for idxf in idx_pack:
+        keys = idxf["keys"]
+        if not keys:
             continue
-        for i, line in enumerate(lines):
-            if rx.match(line):
-                if msg_prefix_esc and msg_prefix and re.search(msg_prefix_esc, line) is None:
-                    continue
-                s = max(0, i - pre_lines)
-                return f.get("name", "unknown"), lines[s:i], lines[i : min(len(lines), i + 1 + post_lines)]
+        pos = bisect_left(keys, key)
+        start = max(0, pos - 3)
+        stop = min(len(keys), pos + 4)
+        for j in range(start, stop):
+            if keys[j] != key or idxf["levels"][j] != level:
+                continue
+            lines = _load_file_lines(idxf["path"])
+            if not lines:
+                continue
+            li = idxf["line_idx"][j]
+            line = lines[li]
+            if msg_prefix and msg_prefix not in line:
+                continue
+            s = max(0, li - pre_lines)
+            e = min(len(lines), li + 1 + post_lines)
+            return idxf["name"], lines[s:li], lines[li:e]
+    
     return None, [], []
 
 
-# DB connection
-if "conn" not in st.session_state:
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    ensure_schema(conn)
-    st.session_state["conn"] = conn
+def _build_file_metadata(file_paths: List[Path]) -> Dict[str, Dict[str, Any]]:
+    metadata = {}
+    for fpath in file_paths:
+        lines = _load_file_lines(fpath)
+        timestamps = []
+        for line in lines:
+            m = HEADER_RX.match(line)
+            if not m:
+                continue
+            dt = parse_log_datetime(m.group("dt"))
+            if dt:
+                timestamps.append(dt)
+        
+        if timestamps:
+            metadata[fpath.name] = {
+                "path": fpath,
+                "min_timestamp": min(timestamps),
+                "max_timestamp": max(timestamps),
+                "size_bytes": fpath.stat().st_size if fpath.exists() else 0,
+            }
+    return metadata
 
+
+def _get_files_in_range(
+    file_metadata: Dict[str, Dict[str, Any]],
+    start_dt: datetime,
+    end_dt: datetime,
+) -> List[Path]:
+    matching_files = []
+    for name, meta in file_metadata.items():
+        file_min = meta["min_timestamp"]
+        file_max = meta["max_timestamp"]
+        if file_min >= start_dt and file_max <= end_dt:
+            matching_files.append(meta["path"])
+    return matching_files
+
+
+def _create_logs_zip(file_paths: List[Path], time_range: Optional[Tuple[datetime, datetime]] = None) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fpath in file_paths:
+            if fpath.exists():
+                zf.write(fpath, fpath.name)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _get_zip_filename(time_range: Optional[Tuple[datetime, datetime]] = None) -> str:
+    if time_range:
+        start_str = time_range[0].strftime("%Y-%m-%d_%H-%M")
+        end_str = time_range[1].strftime("%Y-%m-%d_%H-%M")
+        return f"logs_selected_{start_str}_to_{end_str}.zip"
+    else:
+        return f"logs_all_{datetime.now().strftime('%Y-%m-%d')}.zip"
+
+
+def cleanup_session():
+    temp_dir = st.session_state.get("temp_dir")
+    if temp_dir and Path(temp_dir).exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    db_path = st.session_state.get("db_path")
+    if db_path and Path(db_path).exists():
+        try:
+            conn = st.session_state.get("conn")
+            if conn:
+                conn.close()
+            Path(db_path).unlink()
+        except Exception:
+            pass
+
+def init_session():
+    if "session_initialized" not in st.session_state:
+        cleanup_session()
+        
+        temp_dir = tempfile.mkdtemp(prefix="id_iota_")
+        st.session_state["temp_dir"] = temp_dir
+        
+        db_path = Path(temp_dir) / "logs.db"
+        st.session_state["db_path"] = str(db_path)
+        conn = get_connection(db_path)
+        ensure_schema(conn)
+        st.session_state["conn"] = conn
+        
+        st.session_state["session_initialized"] = True
+        st.session_state["uploaded_file_paths"] = []
+        st.session_state["file_metadata"] = {}
+        st.session_state["time_selection"] = {"start": None, "end": None, "active": False}
+        
+        atexit.register(cleanup_session)
+
+init_session()
 conn = st.session_state["conn"]
 
-# Sidebar: uploader
 with st.sidebar:
     uploaded = st.file_uploader("Drop .log files here", type=["log"], accept_multiple_files=True)
     if st.button("Load uploaded logs", type="primary", width='stretch'):
         if not uploaded:
             st.warning("Please upload at least one log file.")
         else:
-            # Keep raw texts for context-rich TXT reports (±N lines extraction)
-            raw_texts = []
+            conn.execute("DELETE FROM miners")
+            conn.execute("DELETE FROM backward_events")
+            conn.execute("DELETE FROM loss_events")
+            conn.execute("DELETE FROM state_events")
+            conn.execute("DELETE FROM exceptions")
+            conn.commit()
+            
+            temp_dir = Path(st.session_state["temp_dir"])
+            for old_file in st.session_state.get("uploaded_file_paths", []):
+                if old_file.exists():
+                    old_file.unlink()
+            
+            file_paths = []
             for idx, uf in enumerate(uploaded, start=1):
-                name = getattr(uf, "name", f"uploaded_{idx}")
-                try:
-                    text = uf.getvalue().decode("utf-8", errors="replace")
-                except Exception:
-                    text = ""
-                raw_texts.append({"name": name, "text": text, "lines": text.splitlines()})
-            st.session_state["uploaded_texts"] = raw_texts
-
-            # Ingest uploads
+                name = getattr(uf, "name", f"uploaded_{idx}.log")
+                file_path = temp_dir / name
+                with open(file_path, "wb") as f:
+                    f.write(uf.getvalue())
+                file_paths.append(file_path)
+            
+            st.session_state["uploaded_file_paths"] = file_paths
+            
+            if "report_index" in st.session_state:
+                del st.session_state["report_index"]
+            
+            with st.spinner("Building file metadata..."):
+                st.session_state["file_metadata"] = _build_file_metadata(file_paths)
+            
             with st.spinner("Parsing uploaded logs..."):
                 total_files, total_lines, counters = ingest_uploaded_files(
                     conn=conn,
@@ -154,12 +248,9 @@ with st.sidebar:
                     tz_name=TZ_NAME,
                     progress_callback=lambda msg: st.sidebar.write(msg),
                 )
-            st.success(f"Parsed {total_files} file(s), ~{total_lines:,} line(s). ")
+            st.success(f"Parsed {total_files} file(s), ~{total_lines:,} line(s).")
 
-# --------------------------------------------------------------------
-# Main page
-# ---------------- ---------------------------------------------------- 
-with st.container(horizontal=True, horizontal_alignment="left"):
+with st.container(horizontal=True):
     st.image(_LOGO, width=177)
     with st.container():
         st.title(APP_TITLE)
@@ -167,7 +258,6 @@ with st.container(horizontal=True, horizontal_alignment="left"):
 
 anti_doxx = st.checkbox("anti-doxx", value=False)
 
-# Miner list
 miners_available = list_miners(conn)
 miners_filtered = [m for m in miners_available if isinstance(m, str) and len(m) == 8 and m not in ["shutdown"]]
 
@@ -175,7 +265,6 @@ if not miners_filtered:
     st.info("No logs with valid 8-char hotkeys yet. Upload log files in the sidebar and click **Load uploaded logs**.")
     st.stop()
 
-# Controls row: just the multiselect; 
 def make_hotkey_mask(values: List[str]) -> Dict[str, str]:
     uniq = []
     for v in values:
@@ -203,9 +292,6 @@ if not selected_miners:
 
 st.divider()
 
-# --------------------------------------------------------------------
-# Summary table. Mask hotkeys if anti-doxx.
-# --------------------------------------------------------------------
 summary_df = build_last_seen_summary(conn, TZ_NAME, miners=selected_miners)
 if not summary_df.empty:
     if anti_doxx:
@@ -214,22 +300,24 @@ if not summary_df.empty:
     st.dataframe(
         summary_df.reset_index(drop=True),
         hide_index=True,
-        width="stretch",
+        width='stretch',
     )
 else:
     st.info("No state info yet for selected miners.")
 
 st.divider()
 
-# --------------------------------------------------------------------
-# Query full timeline
-# --------------------------------------------------------------------
 bw_df = query_backward_events(conn, TZ_NAME, miners=selected_miners)
 loss_df = query_losses(conn, TZ_NAME, miners=selected_miners)
 state_df = query_states(conn, TZ_NAME, miners=selected_miners)
-exc_df = query_exceptions(conn, TZ_NAME, miners=selected_miners)  # use directly
 
-# Helper: mask hotkeys inside arbitrary text
+time_selection = st.session_state.get("time_selection", {"start": None, "end": None, "active": False})
+time_range = None
+if time_selection["active"]:
+    time_range = (time_selection["start"], time_selection["end"])
+
+exc_df = query_exceptions(conn, TZ_NAME, miners=selected_miners, time_range=time_range)
+
 _hotkey_kv_rx = re.compile(r"('hotkey'\s*:\s*')([A-Za-z0-9]{8})(')")
 
 def mask_text_hotkeys(text: str) -> str:
@@ -243,15 +331,11 @@ def mask_text_hotkeys(text: str) -> str:
 
     out = _hotkey_kv_rx.sub(repl, text)
 
-    # Also mask any selected miner occurrences verbatim
     for real, masked in mask_map_full.items():
         if real in selected_miners:
             out = out.replace(real, masked)
     return out
 
-# --------------------------------------------------------------------
-# Chart: Backwards since reset over time
-# --------------------------------------------------------------------
 st.subheader("Backward passes over time")
 
 def _plot_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -268,7 +352,6 @@ if bw_plot.empty:
 else:
     fig = go.Figure()
 
-    # Backward traces
     for miner, mdf in bw_plot.groupby("miner_hotkey"):
         mdf = mdf.sort_values("ts_local")
         mdf = mdf.loc[mdf["since_reset"].ne(mdf["since_reset"].shift())]
@@ -286,7 +369,6 @@ else:
             )
         )
 
-    # Loss points
     if not loss_plot.empty:
         for miner, ldf in loss_plot.groupby("miner_hotkey"):
             ldf = ldf.sort_values("ts_local")
@@ -305,7 +387,6 @@ else:
                 )
             )
 
-    # Exception markers
     if not exc_df.empty:
         fig.update_layout(
             yaxis3=dict(
@@ -320,13 +401,7 @@ else:
         )
         miner_masked = exc_df["miner_hotkey"].astype(str).map(mask_hotkey if anti_doxx else (lambda x: x))
         message_masked = exc_df["message"].astype(str).map(mask_text_hotkeys if anti_doxx else (lambda x: x))
-        custom = pd.concat(
-            [
-                miner_masked,
-                message_masked,
-            ],
-            axis=1,
-        ).values
+        custom = pd.concat([miner_masked, message_masked], axis=1).values
 
         fig.add_trace(
             go.Scatter(
@@ -341,7 +416,17 @@ else:
             )
         )
 
-    # Layout
+    if time_selection["active"]:
+        fig.add_vrect(
+            x0=time_selection["start"],
+            x1=time_selection["end"],
+            fillcolor="lightblue",
+            opacity=0.2,
+            layer="below",
+            line_width=2,
+            line_color="blue",
+        )
+
     layout_kwargs = dict(
         title=None,
         xaxis_title="time",
@@ -349,6 +434,7 @@ else:
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=40, r=40, t=20, b=40),
+        dragmode="select",
     )
     if not loss_plot.empty:
         fig.update_layout(
@@ -358,16 +444,90 @@ else:
     else:
         fig.update_layout(**layout_kwargs)
 
-    st.plotly_chart(fig, width='stretch')
+    selected = st.plotly_chart(fig, width='stretch', on_select="rerun", selection_mode="box")
+    
+    if selected and selected.selection and "box" in selected.selection:
+        box_selection = selected.selection["box"]
+        if box_selection and len(box_selection) > 0:
+            x_range = box_selection[0].get("x", [])
+            if len(x_range) == 2:
+                start_dt = pd.to_datetime(x_range[0])
+                end_dt = pd.to_datetime(x_range[1])
+                if start_dt > end_dt:
+                    start_dt, end_dt = end_dt, start_dt
+                st.session_state["time_selection"] = {
+                    "start": start_dt.to_pydatetime(),
+                    "end": end_dt.to_pydatetime(),
+                    "active": True,
+                }
+                st.rerun()
+    
+    if time_selection["active"]:
+        with st.container(border=True):
+            st.markdown("### 📅 Active Time Range Filter")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                start_str = time_selection["start"].strftime("%Y-%m-%d %H:%M:%S")
+                end_str = time_selection["end"].strftime("%Y-%m-%d %H:%M:%S")
+                duration = time_selection["end"] - time_selection["start"]
+                hours = duration.total_seconds() / 3600
+                st.write(f"**From:** {start_str}")
+                st.write(f"**To:** {end_str}")
+                st.write(f"**Duration:** {hours:.1f}h")
+                
+                file_metadata = st.session_state.get("file_metadata", {})
+                if file_metadata:
+                    filtered_files = _get_files_in_range(
+                        file_metadata,
+                        time_selection["start"],
+                        time_selection["end"],
+                    )
+                    total_files = len(file_metadata)
+                    st.write(f"**Files in range:** {len(filtered_files)} of {total_files}")
+            
+            with col2:
+                if st.button("Clear Selection", width='stretch'):
+                    st.session_state["time_selection"] = {"start": None, "end": None, "active": False}
+                    st.rerun()
+        
+        file_metadata = st.session_state.get("file_metadata", {})
+        if file_metadata:
+            filtered_files = _get_files_in_range(
+                file_metadata,
+                time_selection["start"],
+                time_selection["end"],
+            )
+            if filtered_files:
+                st.markdown("### 📦 Download Filtered Data")
+                col1, col2 = st.columns(2)
+                with col1:
+                    zip_data = _create_logs_zip(filtered_files, time_range)
+                    zip_name = _get_zip_filename(time_range)
+                    st.download_button(
+                        label=f"⬇ Download Selected Logs ({len(filtered_files)} files)",
+                        data=zip_data,
+                        file_name=zip_name,
+                        mime="application/zip",
+                        width='stretch',
+                        type="primary",
+                    )
+                with col2:
+                    if not exc_df.empty:
+                        st.info(f"📄 Report will include {len(exc_df)} exceptions")
+                    else:
+                        st.warning("No exceptions in selected time range")
+            else:
+                st.warning("No log files found in selected time range")
 
-# --------------------------------------------------------------------
-# Exceptions table
-# --------------------------------------------------------------------
+st.divider()
+
 st.subheader("Exceptions (grouped — most frequent first)")
 if exc_df.empty:
-    st.info("No exceptions captured for selected miners.")
+    if time_selection["active"]:
+        st.info("No exceptions captured for selected miners in the selected time range.")
+    else:
+        st.info("No exceptions captured for selected miners.")
 else:
-    # Simplified grouping signature
     group_cols = ["message", "miner_hotkey", "layer"]
 
     grouped = (
@@ -380,7 +540,6 @@ else:
         .reset_index(drop=True)
     )
 
-    # Display: miner_hotkey, count, message
     display_cols = ["miner_hotkey", "count", "message"]
     show_grouped = grouped[display_cols].copy()
 
@@ -398,30 +557,39 @@ else:
             "message": st.column_config.TextColumn("message"),
         },
     )
-    # --- Keep your grouped table code above ---
 
     st.markdown("### Text report")
-    gen_report = st.button("Generate exceptions report (.txt)", type="primary", use_container_width=True)
+    gen_report = st.button("Generate exceptions report (.txt)", type="primary", width='stretch')
 
     if gen_report:
-        _ensure_index()  # build the index only now
+        file_paths: List[Path] = st.session_state.get("uploaded_file_paths", [])
+        
+        if not file_paths:
+            st.warning("No log files available. Please upload logs first.")
+            st.stop()
 
-        uploaded_texts: List[Dict[str, Any]] = st.session_state.get("uploaded_texts", [])
+        time_selection = st.session_state.get("time_selection", {"start": None, "end": None, "active": False})
 
-        # Map groups to EX_IDs
         def _sig_tuple(row: pd.Series) -> Tuple:
             return tuple(row[c] for c in ["message", "miner_hotkey", "layer"])
+        
         sig_to_exid: Dict[Tuple, int] = {}
         for i, row in grouped.iterrows():
             sig_to_exid[_sig_tuple(row)] = i + 1
 
         lines: List[str] = []
         lines.append("=== EXCEPTIONS REPORT ===")
+        if time_selection["active"]:
+            start_str = time_selection["start"].strftime("%Y-%m-%d %H:%M:%S")
+            end_str = time_selection["end"].strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"Time Range: {start_str} to {end_str}")
         lines.append(f"Selected miners: {', '.join(mask_hotkey(m) if anti_doxx else m for m in selected_miners)}")
-        lines.append(f"Total exceptions: {len(exc_df)}")
+        if time_selection["active"]:
+            lines.append(f"Total exceptions: {len(exc_df)} (filtered by time range)")
+        else:
+            lines.append(f"Total exceptions: {len(exc_df)}")
         lines.append("")
 
-        # Groups with counts (unchanged)
         for i, row in grouped.iterrows():
             ex_id = i + 1
             miner_line = mask_hotkey(str(row["miner_hotkey"])) if anti_doxx else str(row["miner_hotkey"])
@@ -431,20 +599,19 @@ else:
             lines.append(f"message: {msg}")
             lines.append("")
 
-        # --- Only last 10 full contexts per type ---
         lines.append("== Full exceptions ==")
-        group_cols = ["message", "miner_hotkey", "layer"]
         exc_sorted = exc_df.sort_values("ts_local")
         keep_chunks = []
         for _, g in exc_sorted.groupby(group_cols, dropna=False):
             keep_chunks.append(g.tail(10) if len(g) > 10 else g)
         exc_filtered = pd.concat(keep_chunks).sort_values("ts_local")
+        
         if len(exc_filtered) < len(exc_sorted):
             lines.append("NOTE: For exception types with > 10 occurrences, only the last 10 full exceptions are included below.")
             lines.append("")
 
         total_exc = len(exc_filtered)
-        prog = st.progress(0, text="Gathering context from raw logs…")
+        prog = st.progress(0, text="Gathering context from log files…")
 
         for idx, r in exc_filtered.reset_index(drop=True).iterrows():
             key = tuple((r[c] if pd.notna(r[c]) else "") for c in group_cols)
@@ -455,14 +622,14 @@ else:
                 ts_local=r["ts_local"],
                 level=level_val,
                 message=str(r.get("message", "")),
-                files=uploaded_texts,
+                file_paths=file_paths,
                 pre_lines=100,
                 post_lines=25,
             )
 
             lines.append(f"EX_ID {ex_id}:")
             if src_name is None:
-                lines.append("(context unavailable — raw logs not loaded in this session or header not found)")
+                lines.append("(context unavailable — header not found in logs)")
                 flat_msg = mask_text_hotkeys(str(r["message"])) if anti_doxx else str(r["message"])
                 miner_line = mask_hotkey(str(r["miner_hotkey"])) if anti_doxx else str(r["miner_hotkey"])
                 lines.append(f"{r['ts_local']} | miner={miner_line} | layer={r['layer']} | message={flat_msg}")
@@ -482,6 +649,10 @@ else:
                 prog.progress((idx + 1) / total_exc, text=f"Gathering context… {idx + 1}/{total_exc}")
 
         prog.empty()
+        
+        if "report_index" in st.session_state:
+            del st.session_state["report_index"]
+        
         report_text = "\n".join(lines)
 
         st.download_button(
@@ -489,8 +660,7 @@ else:
             data=report_text,
             file_name="exceptions_report.txt",
             mime="text/plain",
-            use_container_width=True,
+            width='stretch',
         )
     else:
         st.caption("Click the button to build the text report.")
-
