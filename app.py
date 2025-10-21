@@ -169,6 +169,19 @@ def _get_zip_filename(time_range: Optional[Tuple[datetime, datetime]] = None) ->
         return f"logs_all_{datetime.now().strftime('%Y-%m-%d')}.zip"
 
 
+def _apply_exception_filters(df: pd.DataFrame, filters: List[str]) -> pd.DataFrame:
+    if df.empty or not filters:
+        return df
+    
+    mask = pd.Series([True] * len(df), index=df.index)
+    for filter_pattern in filters:
+        if filter_pattern.strip():
+            pattern_lower = filter_pattern.lower()
+            mask &= ~df["message"].astype(str).str.lower().str.contains(pattern_lower, regex=False, na=False)
+    
+    return df[mask].copy()
+
+
 def cleanup_session():
     temp_dir = st.session_state.get("temp_dir")
     if temp_dir and Path(temp_dir).exists():
@@ -201,6 +214,7 @@ def init_session():
         st.session_state["uploaded_file_paths"] = []
         st.session_state["file_metadata"] = {}
         st.session_state["time_selection"] = {"start": None, "end": None, "active": False}
+        st.session_state["exception_filters"] = ["Miner is moving state from LayerPhase.TRAINING to LayerPhase.WEIGHTS_UPLOADING"]
         
         atexit.register(cleanup_session)
 
@@ -316,7 +330,8 @@ time_range = None
 if time_selection["active"]:
     time_range = (time_selection["start"], time_selection["end"])
 
-exc_df = query_exceptions(conn, TZ_NAME, miners=selected_miners, time_range=time_range)
+exc_df_raw = query_exceptions(conn, TZ_NAME, miners=selected_miners, time_range=time_range)
+exc_df = _apply_exception_filters(exc_df_raw, st.session_state["exception_filters"])
 
 _hotkey_kv_rx = re.compile(r"('hotkey'\s*:\s*')([A-Za-z0-9]{8})(')")
 
@@ -521,12 +536,62 @@ else:
 
 st.divider()
 
+with st.expander(f"🔍 Exception Filters ({len(st.session_state['exception_filters'])} active)", expanded=False):
+    st.caption("Exceptions containing these patterns will be hidden from the display and report.")
+    
+    filters = st.session_state["exception_filters"]
+    
+    if filters:
+        st.markdown("**Active filters:**")
+        for idx, filter_text in enumerate(filters):
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                display_text = filter_text if len(filter_text) <= 100 else filter_text[:97] + "..."
+                st.text(display_text)
+            with col2:
+                if st.button("✕", key=f"remove_filter_{idx}", help="Remove this filter"):
+                    st.session_state["exception_filters"].pop(idx)
+                    st.rerun()
+    else:
+        st.info("No active filters. All exceptions will be shown.")
+    
+    st.markdown("**Add new filter:**")
+    new_filter = st.text_input(
+        "Pattern to filter",
+        placeholder="Enter text pattern to filter out...",
+        label_visibility="collapsed",
+        key="new_filter_input"
+    )
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("Add Filter", type="primary"):
+            if new_filter and new_filter.strip():
+                if new_filter in st.session_state["exception_filters"]:
+                    st.warning("This filter already exists.")
+                else:
+                    st.session_state["exception_filters"].append(new_filter)
+                    st.success("Filter added!")
+                    st.rerun()
+            else:
+                st.warning("Please enter a filter pattern.")
+
 st.subheader("Exceptions (grouped — most frequent first)")
+
+total_exc_raw = len(exc_df_raw)
+total_exc_filtered = len(exc_df)
+filtered_count = total_exc_raw - total_exc_filtered
+
+if filtered_count > 0:
+    st.caption(f"Showing {total_exc_filtered} of {total_exc_raw} exceptions ({filtered_count} hidden by filters)")
+elif total_exc_filtered > 0:
+    st.caption(f"Showing all {total_exc_filtered} exceptions (no filters applied)")
+
 if exc_df.empty:
     if time_selection["active"]:
-        st.info("No exceptions captured for selected miners in the selected time range.")
+        st.info("No exceptions captured for selected miners in the selected time range (after filtering).")
     else:
-        st.info("No exceptions captured for selected miners.")
+        st.info("No exceptions captured for selected miners (after filtering).")
 else:
     group_cols = ["message", "miner_hotkey", "layer"]
 
@@ -584,10 +649,14 @@ else:
             end_str = time_selection["end"].strftime("%Y-%m-%d %H:%M:%S")
             lines.append(f"Time Range: {start_str} to {end_str}")
         lines.append(f"Selected miners: {', '.join(mask_hotkey(m) if anti_doxx else m for m in selected_miners)}")
+        if st.session_state["exception_filters"]:
+            lines.append(f"Active exception filters: {len(st.session_state['exception_filters'])}")
+            for filt in st.session_state["exception_filters"]:
+                lines.append(f"  - {filt}")
         if time_selection["active"]:
-            lines.append(f"Total exceptions: {len(exc_df)} (filtered by time range)")
+            lines.append(f"Total exceptions: {len(exc_df)} (filtered from {total_exc_raw})")
         else:
-            lines.append(f"Total exceptions: {len(exc_df)}")
+            lines.append(f"Total exceptions: {len(exc_df)} (filtered from {total_exc_raw})")
         lines.append("")
 
         for i, row in grouped.iterrows():
