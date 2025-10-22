@@ -45,6 +45,27 @@ def query_backward_events(conn: sqlite3.Connection, tz_name: str, miners: Option
     return df
 
 
+def query_forward_events(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT miner_hotkey, layer, ts AS ts_iso, activation_id
+        FROM forward_events
+        ORDER BY ts ASC
+        """,
+        conn,
+    )
+    if df.empty:
+        return df
+
+    df = _maybe_filter_miners(df, miners)
+    if df.empty:
+        return df
+
+    df["ts_local"] = _to_naive_local(df["ts_iso"], tz_name)
+    df = df[df["ts_local"].notna()]
+    return df
+
+
 def query_losses(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
     df = pd.read_sql_query(
         """
@@ -101,7 +122,7 @@ def query_exceptions(
 ) -> pd.DataFrame:
     df = pd.read_sql_query(
         """
-        SELECT miner_hotkey, layer, ts AS ts_iso, ex_type, level, http_endpoint, http_code, message
+        SELECT miner_hotkey, layer, ts AS ts_iso, ex_type, level, http_endpoint, http_code, message, message_normalized
         FROM exceptions
         ORDER BY ts ASC
         """,
@@ -139,4 +160,4 @@ def build_last_seen_summary(conn: sqlite3.Connection, tz_name: str, miners: Opti
         },
         inplace=True,
     )
-    return last_rows.sort_values("miner_hotkey").reset_index(drop=True)
+    return last_rows.reset_index(drop=True)

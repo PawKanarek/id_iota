@@ -9,21 +9,16 @@ import io
 
 from .timeutil import parse_log_datetime
 
-# Public API: in-memory uploads ingestion
 def ingest_uploaded_files(
     conn: sqlite3.Connection,
-    uploaded_files,  # list[streamlit.runtime.uploaded_file_manager.UploadedFile]
+    uploaded_files,
     tz_name: str,
     progress_callback: Optional[Callable[[str], None]] = None,
 ):
-    """
-    Parse a list of uploaded files fully in-memory (no disk, no offsets).
-    Returns (total_files, total_lines, counters_sum).
-    """
     rx = _RegexBundle()
     total_files = 0
     total_lines = 0
-    counters_sum: Dict[str, int] = {"backward": 0, "loss": 0, "states": 0, "exceptions": 0}
+    counters_sum: Dict[str, int] = {"backward": 0, "forward": 0, "loss": 0, "states": 0, "exceptions": 0}
 
     for idx, uf in enumerate(uploaded_files, start=1):
         name = getattr(uf, "name", f"uploaded_{idx}")
@@ -50,7 +45,6 @@ def ingest_uploaded_files(
     return total_files, total_lines, counters_sum
 
 
-# Core ingestion logic against a text buffer
 def _ingest_stream(
     conn: sqlite3.Connection,
     text: str,
@@ -58,14 +52,10 @@ def _ingest_stream(
     rx: "._RegexBundle",
     progress_callback: Optional[Callable[[str], None]],
 ) -> Tuple[int, int, dict]:
-    """
-    Same logic as the legacy file parser but reading from an in-memory text buffer.
-    Returns (lines_processed, dummy_offset, counters).
-    """
     tz_local = ZoneInfo(tz_name)
     miners_cache: set[str] = set()
     last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
-    counters = {"backward": 0, "loss": 0, "states": 0, "exceptions": 0}
+    counters = {"backward": 0, "forward": 0, "loss": 0, "states": 0, "exceptions": 0}
 
     n_lines = 0
     cur = conn.cursor()
@@ -92,7 +82,6 @@ def _ingest_stream(
                 miners_cache.add(miner)
             last_ctx = {"ts_utc_iso": ts_utc_iso, "miner": miner, "layer": _int_or_none(layer)}
 
-            # Backward (explicit)
             mb = rx.backward_since_reset.search(msg)
             if mb:
                 miner_b = mb.group("miner")
@@ -108,7 +97,16 @@ def _ingest_stream(
                 counters["backward"] += 1
                 continue
 
-            # Loss
+            mf = rx.forward_activation.search(msg)
+            if mf:
+                activation_id = mf.group(1)
+                cur.execute(
+                    "INSERT INTO forward_events (miner_hotkey, layer, ts, activation_id) VALUES (?, ?, ?, ?)",
+                    (miner or "", _int_or_none(layer), ts_utc_iso, activation_id),
+                )
+                counters["forward"] += 1
+                continue
+
             ml = rx.loss.search(msg)
             if ml:
                 loss = float(ml.group("loss"))
@@ -130,7 +128,6 @@ def _ingest_stream(
                 counters["loss"] += 1
                 continue
 
-            # State line
             ms = rx.state_line.search(msg)
             if ms:
                 miner_s = ms.group("miner")
@@ -148,20 +145,25 @@ def _ingest_stream(
                 counters["states"] += 1
                 continue
 
-            # Exceptions
             if level in ("ERROR", "CRITICAL"):
                 ex_type, http_endpoint, http_code = _extract_exception_bits(rx, msg)
+                cleaned_msg = _clean_message(msg)
+                
+                if not cleaned_msg or not cleaned_msg.strip() or cleaned_msg.strip() in ('|', '||', '|||'):
+                    continue
+                
+                normalized_msg = _normalize_exception_message(cleaned_msg)
+                
                 cur.execute(
-                    "INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, msg.strip()),
+                    "INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg),
                 )
                 counters["exceptions"] += 1
                 continue
 
-            continue  # next line
+            continue
 
-        # continuation line
         mstep = rx.backward_in_step.search(line)
         if mstep:
             since_reset = int(mstep.group("count"))
@@ -232,23 +234,105 @@ def _extract_exception_bits(rx: "._RegexBundle", msg: str) -> Tuple[Optional[str
     return ex_type, endpoint, code
 
 
-# Regex bundle
+def _clean_message(msg: str) -> str:
+    msg = msg.strip()
+    
+    while msg.startswith('|'):
+        msg = msg[1:].strip()
+    
+    if msg.startswith("{") and msg.endswith("}"):
+        return ""
+    
+    last_pipe_brace = msg.rfind(" | {")
+    if last_pipe_brace != -1:
+        potential_dict = msg[last_pipe_brace + 3:].strip()
+        if potential_dict.startswith("{") and potential_dict.endswith("}"):
+            return msg[:last_pipe_brace].strip()
+    
+    return msg
+
+
+def _normalize_exception_message(msg: str) -> str:
+    normalized = msg
+    
+    prefixes_to_strip = [
+        "Error reporting loss: ",
+        "Error during backward step: ",
+        "Error making orchestrator request: ",
+        "Failed to process: ",
+        "Exception occurred: ",
+        "RuntimeError: ",
+    ]
+    for prefix in prefixes_to_strip:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    
+    normalized = re.sub(r'\{[^}]*"detail"[^}]*\}', '<JSON>', normalized)
+    normalized = re.sub(r'\{[^}]*"error"[^}]*\}', '<JSON>', normalized)
+    normalized = re.sub(r'\{[^}]*\}', '<JSON>', normalized)
+    
+    normalized = re.sub(
+        r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
+        '<UUID>',
+        normalized
+    )
+    
+    normalized = re.sub(r'\b[A-Za-z0-9]{8,}\.\.\.', '<ID>', normalized)
+    
+    normalized = re.sub(
+        r"(hotkey|miner)['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9]{8,}['\"]?",
+        r"\1: '<HOTKEY>'",
+        normalized,
+        flags=re.IGNORECASE
+    )
+    normalized = re.sub(r'\b[A-Za-z0-9]{48}\b', '<HOTKEY>', normalized)
+    
+    normalized = re.sub(r'after \d+ attempts?', 'after <N> attempts', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'attempt \d+ of \d+', 'attempt <N> of <N>', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'retry \d+', 'retry <N>', normalized, flags=re.IGNORECASE)
+    
+    normalized = re.sub(r'\b(status|code|HTTP)[:\s]*[1-5]\d{2}\b', r'\1: <HTTP_CODE>', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\b[1-5]\d{2}\s*,\s*\{', '<HTTP_CODE>, {', normalized)
+    
+    normalized = re.sub(r'\b0x[0-9a-fA-F]{8,}\b', '<HEX_ID>', normalized)
+    
+    normalized = re.sub(
+        r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?',
+        '<TIMESTAMP>',
+        normalized
+    )
+    
+    normalized = re.sub(r'\b(batch|step|epoch|iteration|layer)\s+\d+\b', r'\1 <N>', normalized, flags=re.IGNORECASE)
+    
+    normalized = re.sub(r'\b\d+\.\d+\b', '<NUMBER>', normalized)
+    
+    normalized = re.sub(r'\b\d{7,}\b', '<LARGE_NUMBER>', normalized)
+    
+    normalized = re.sub(
+        r"(activation_id|request_id|task_id|job_id|session_id)['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9-]+['\"]?",
+        r"\1: '<ID>'",
+        normalized,
+        flags=re.IGNORECASE
+    )
+    
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    return normalized
+
+
 class _RegexBundle:
     def __init__(self) -> None:
-        # Timestamped header: "YYYY-mm-dd HH:MM:SS(.ffffff) | LEVEL | where | message ..."
         self.header = re.compile(
             r"^(?P<dt>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\s+\|\s+(?P<level>[A-Z]+)\s+\|[^|]*\|\s+(?P<msg>.*)$"
         )
 
-        # Tail dict: ... | {'hotkey': 'XXXXX', 'layer': N}
         self.tail_hotkey = re.compile(r"'hotkey'\s*:\s*'(?P<hotkey>[A-Za-z0-9]+)'")
         self.tail_layer = re.compile(r"'layer'\s*:\s*(?P<layer>\d+)")
 
-        # Message miner/layer (flexible with optional colon)
         self.msg_miner = re.compile(r"\bMiner:?\s*(?P<miner>[A-Za-z0-9]+)\b")
         self.msg_layer = re.compile(r"\bLayer:?\s*(?P<layer>\d+)\b")
 
-        # Backward since reset — two variants
         self.backward_since_reset = re.compile(
             r"Backwards since reset for miner\s+(?P<miner>[A-Za-z0-9]+)\s*:\s*(?P<count>\d+)",
             re.IGNORECASE,
@@ -258,20 +342,19 @@ class _RegexBundle:
             re.IGNORECASE,
         )
 
-        # Loss line
+        self.forward_activation = re.compile(r"🚀 Starting FORWARD pass.*?activation\s+([a-f0-9\-]+)")
+
         self.loss = re.compile(r"Computed loss\s+(?P<loss>[0-9]*\.?[0-9]+)", re.IGNORECASE)
 
-        # State line
         self.state_line = re.compile(
             r"Miner\s+(?P<miner>[A-Za-z0-9]+)\s+in Layer\s+(?P<layer>\d+)\s+is in state:\s+LayerPhase\.(?P<state>[A-Z_]+)",
             re.IGNORECASE,
         )
 
-        # Exceptions
         self.api_exception = re.compile(r"\bAPI\s*Exception\b|\bAPIException\b", re.IGNORECASE)
         self.runtime_error = re.compile(r"\bRuntimeError\b|\bError during backward step\b", re.IGNORECASE)
         self.http_endpoint = re.compile(r"endpoint\s+(?P<endpoint>/[A-Za-z0-9/_-]+)")
-        self.http_code = re.compile(r"(?P<code>\d{3})(?=\s*-\s)")  # first status code before " - "
+        self.http_code = re.compile(r"(?P<code>\d{3})(?=\s*-\s)")
 
 
 def _log(cb: Optional[Callable[[str], None]], msg: str) -> None:

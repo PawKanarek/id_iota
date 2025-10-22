@@ -18,11 +18,12 @@ import streamlit as st
 from bisect import bisect_left
 from minerlogs.timeutil import parse_log_datetime
 
-from minerlogs.db import ensure_schema, get_connection
+from minerlogs.db import ensure_schema, get_connection, migrate_normalize_messages
 from minerlogs.ingest import ingest_uploaded_files
 from minerlogs.queries import (
     list_miners,
     query_backward_events,
+    query_forward_events,
     query_losses,
     query_states,
     query_exceptions,
@@ -145,7 +146,7 @@ def _get_files_in_range(
     for name, meta in file_metadata.items():
         file_min = meta["min_timestamp"]
         file_max = meta["max_timestamp"]
-        if file_min >= start_dt and file_max <= end_dt:
+        if file_min <= end_dt and file_max >= start_dt:
             matching_files.append(meta["path"])
     return matching_files
 
@@ -177,10 +178,22 @@ def _apply_exception_filters(df: pd.DataFrame, filters: List[str]) -> pd.DataFra
     for filter_pattern in filters:
         if filter_pattern.strip():
             pattern_lower = filter_pattern.lower()
-            mask &= ~df["message"].astype(str).str.lower().str.contains(pattern_lower, regex=False, na=False)
+            mask &= ~df["message_normalized"].astype(str).str.lower().str.contains(pattern_lower, regex=False, na=False)
     
     return df[mask].copy()
 
+def _count_exceptions_per_filter(df: pd.DataFrame, filters: List[str]) -> Dict[str, int]:
+    if df.empty or not filters:
+        return {}
+    
+    counts = {}
+    for filter_pattern in filters:
+        if filter_pattern.strip():
+            pattern_lower = filter_pattern.lower()
+            match_mask = df["message_normalized"].astype(str).str.lower().str.contains(pattern_lower, regex=False, na=False)
+            counts[filter_pattern] = match_mask.sum()
+    
+    return counts
 
 def cleanup_session():
     temp_dir = st.session_state.get("temp_dir")
@@ -208,12 +221,14 @@ def init_session():
         st.session_state["db_path"] = str(db_path)
         conn = get_connection(db_path)
         ensure_schema(conn)
+        migrate_normalize_messages(conn)
         st.session_state["conn"] = conn
         
         st.session_state["session_initialized"] = True
         st.session_state["uploaded_file_paths"] = []
         st.session_state["file_metadata"] = {}
         st.session_state["time_selection"] = {"start": None, "end": None, "active": False}
+        st.session_state["filter_expander_open"] = False
         st.session_state["exception_filters"] = ["Miner is moving state from LayerPhase.TRAINING to LayerPhase.WEIGHTS_UPLOADING"]
         
         atexit.register(cleanup_session)
@@ -229,6 +244,7 @@ with st.sidebar:
         else:
             conn.execute("DELETE FROM miners")
             conn.execute("DELETE FROM backward_events")
+            conn.execute("DELETE FROM forward_events")
             conn.execute("DELETE FROM loss_events")
             conn.execute("DELETE FROM state_events")
             conn.execute("DELETE FROM exceptions")
@@ -322,6 +338,7 @@ else:
 st.divider()
 
 bw_df = query_backward_events(conn, TZ_NAME, miners=selected_miners)
+fw_df = query_forward_events(conn, TZ_NAME, miners=selected_miners)
 loss_df = query_losses(conn, TZ_NAME, miners=selected_miners)
 state_df = query_states(conn, TZ_NAME, miners=selected_miners)
 
@@ -360,10 +377,11 @@ def _plot_filter(df: pd.DataFrame) -> pd.DataFrame:
     return df[msk].copy()
 
 bw_plot = _plot_filter(bw_df)
+fw_plot = _plot_filter(fw_df)
 loss_plot = _plot_filter(loss_df)
 
-if bw_plot.empty:
-    st.info("No backward events found for selected miners.")
+if bw_plot.empty and fw_plot.empty:
+    st.info("No backward or forward events found for selected miners.")
 else:
     fig = go.Figure()
 
@@ -379,10 +397,29 @@ else:
                 x=mdf["ts_local"],
                 y=mdf["since_reset"],
                 mode="lines+markers",
-                name=label,
+                name=f"{label} (backward)",
                 hovertemplate="%{x}<br>backwards_since_reset=%{y}<extra></extra>",
             )
         )
+
+    if not fw_plot.empty:
+        for miner, fdf in fw_plot.groupby("miner_hotkey"):
+            fdf = fdf.sort_values("ts_local")
+            raw_label = mask_map_full.get(miner, miner) if anti_doxx else miner
+            label = raw_label if (isinstance(raw_label, str) and raw_label.strip()) else "unknown"
+            
+            y_values = list(range(len(fdf)))
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=fdf["ts_local"],
+                    y=y_values,
+                    mode="markers",
+                    name=f"{label} (forward)",
+                    marker=dict(size=2),
+                    hovertemplate="%{x}<br>forward_count=%{y}<extra></extra>",
+                )
+            )
 
     if not loss_plot.empty:
         for miner, ldf in loss_plot.groupby("miner_hotkey"):
@@ -395,7 +432,7 @@ else:
                     x=ldf["ts_local"],
                     y=ldf["loss"],
                     mode="markers",
-                    name=f"loss {label}",
+                    name=f"{label} (loss)",
                     yaxis="y2",
                     marker=dict(symbol="circle-open"),
                     hovertemplate="%{x}<br>loss=%{y:.4f}<extra></extra>",
@@ -445,11 +482,79 @@ else:
     layout_kwargs = dict(
         title=None,
         xaxis_title="time",
-        yaxis_title="backwards_since_reset",
+        yaxis_title="backwards_since_reset / forward_count",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=40, r=40, t=20, b=40),
+        margin=dict(l=40, r=40, t=40, b=80),
         dragmode="select",
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=[
+                    dict(
+                        label="⬤ Backward",
+                        method="restyle",
+                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(backward)" in trace.name]],
+                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(backward)" in trace.name]],
+                    ),
+                ],
+                pad={"r": 10, "t": 5, "b": 5, "l": 10},
+                showactive=False,
+                x=0.15,
+                xanchor="left",
+                y=-0.15,
+                yanchor="top",
+                bgcolor="rgba(0, 0, 0, 0)",
+                bordercolor="rgba(0, 0, 0, 0)",
+                borderwidth=0,
+                font=dict(size=11),
+            ),
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=[
+                    dict(
+                        label="⬤ Forward",
+                        method="restyle",
+                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(forward)" in trace.name]],
+                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(forward)" in trace.name]],
+                    ),
+                ],
+                pad={"r": 10, "t": 5, "b": 5, "l": 10},
+                showactive=False,
+                x=0.42,
+                xanchor="left",
+                y=-0.15,
+                yanchor="top",
+                bgcolor="rgba(0, 0, 0, 0)",
+                bordercolor="rgba(0, 0, 0, 0)",
+                borderwidth=0,
+                font=dict(size=11),
+            ),
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=[
+                    dict(
+                        label="⬤ Loss",
+                        method="restyle",
+                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(loss)" in trace.name]],
+                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(loss)" in trace.name]],
+                    ),
+                ],
+                pad={"r": 10, "t": 5, "b": 5, "l": 10},
+                showactive=False,
+                x=0.65,
+                xanchor="left",
+                y=-0.15,
+                yanchor="top",
+                bgcolor="rgba(0, 0, 0, 0)",
+                bordercolor="rgba(0, 0, 0, 0)",
+                borderwidth=0,
+                font=dict(size=11),
+            ),
+        ]
     )
     if not loss_plot.empty:
         fig.update_layout(
@@ -534,9 +639,12 @@ else:
             else:
                 st.warning("No log files found in selected time range")
 
+filter_counts = _count_exceptions_per_filter(exc_df_raw, st.session_state["exception_filters"])
 st.divider()
 
-with st.expander(f"🔍 Exception Filters ({len(st.session_state['exception_filters'])} active)", expanded=False):
+expander_open = st.session_state.get("filter_expander_open", False)
+
+with st.expander(f"🔍 Exception Filters ({len(st.session_state['exception_filters'])} active)", expanded=expander_open):
     st.caption("Exceptions containing these patterns will be hidden from the display and report.")
     
     filters = st.session_state["exception_filters"]
@@ -544,13 +652,17 @@ with st.expander(f"🔍 Exception Filters ({len(st.session_state['exception_filt
     if filters:
         st.markdown("**Active filters:**")
         for idx, filter_text in enumerate(filters):
-            col1, col2 = st.columns([5, 1])
+            col1, col2, col3 = st.columns([4, 1, 0.6])
             with col1:
-                display_text = filter_text if len(filter_text) <= 100 else filter_text[:97] + "..."
+                display_text = filter_text if len(filter_text) <= 80 else filter_text[:77] + "..."
                 st.text(display_text)
             with col2:
+                count = filter_counts.get(filter_text, 0)
+                st.caption(f"🚫 {count}")
+            with col3:
                 if st.button("✕", key=f"remove_filter_{idx}", help="Remove this filter"):
                     st.session_state["exception_filters"].pop(idx)
+                    st.session_state["filter_expander_open"] = True
                     st.rerun()
     else:
         st.info("No active filters. All exceptions will be shown.")
@@ -571,10 +683,14 @@ with st.expander(f"🔍 Exception Filters ({len(st.session_state['exception_filt
                     st.warning("This filter already exists.")
                 else:
                     st.session_state["exception_filters"].append(new_filter)
+                    st.session_state["filter_expander_open"] = True
                     st.success("Filter added!")
                     st.rerun()
             else:
                 st.warning("Please enter a filter pattern.")
+
+if not expander_open:
+    st.session_state["filter_expander_open"] = False
 
 st.subheader("Exceptions (grouped — most frequent first)")
 
@@ -593,35 +709,69 @@ if exc_df.empty:
     else:
         st.info("No exceptions captured for selected miners (after filtering).")
 else:
-    group_cols = ["message", "miner_hotkey", "layer"]
-
+    show_normalized = st.checkbox(
+        "Show normalized messages (groups similar exceptions together)",
+        value=True,
+        help="Normalized messages replace variable parts (UUIDs, IDs, timestamps) with placeholders for better grouping"
+    )
+    
+    group_cols_norm = ["message_normalized"]
     grouped = (
-        exc_df[group_cols]
-        .fillna("")
-        .groupby(group_cols, dropna=False)
-        .size()
-        .reset_index(name="count")
+        exc_df.groupby(group_cols_norm, dropna=False)
+        .agg({
+            "message": "first",
+            "miner_hotkey": lambda x: list(x.unique()),
+            "ts_local": "count"
+        })
+        .rename(columns={"ts_local": "count"})
+        .reset_index()
         .sort_values("count", ascending=False)
         .reset_index(drop=True)
     )
-
-    display_cols = ["miner_hotkey", "count", "message"]
-    show_grouped = grouped[display_cols].copy()
-
-    if anti_doxx:
-        show_grouped["miner_hotkey"] = show_grouped["miner_hotkey"].astype(str).map(mask_hotkey)
-        show_grouped["message"] = show_grouped["message"].astype(str).map(mask_text_hotkeys)
-
-    st.dataframe(
-        show_grouped,
-        width='stretch',
-        hide_index=True,
-        column_config={
-            "miner_hotkey": st.column_config.TextColumn("miner_hotkey"),
-            "count": st.column_config.NumberColumn("count"),
-            "message": st.column_config.TextColumn("message"),
-        },
-    )
+    
+    st.markdown("**Click 🚫 to filter out exception types:**")
+    
+    col_btn, col_miners, col_count, col_msg = st.columns([0.4, 1.5, 0.6, 5.0])
+    with col_btn:
+        st.markdown("**🚫**")
+    with col_miners:
+        st.markdown("**Miners**")
+    with col_count:
+        st.markdown("**Count**")
+    with col_msg:
+        st.markdown("**Message**")
+    
+    for idx, row in grouped.iterrows():
+        col_btn, col_miners, col_count, col_msg = st.columns([0.4, 1.5, 0.6, 5.0])
+        
+        with col_btn:
+            filter_key = f"filter_{idx}"
+            if st.button("🚫", key=filter_key, help="Add to filters"):
+                filter_text = str(row["message_normalized"])
+                if filter_text not in st.session_state["exception_filters"]:
+                    st.session_state["exception_filters"].append(filter_text)
+                    st.rerun()
+        
+        with col_miners:
+            miners_list = row["miner_hotkey"]
+            if len(miners_list) <= 3:
+                miner_names = [mask_hotkey(m) if anti_doxx else m for m in miners_list]
+                miner_display = ", ".join(miner_names)
+            else:
+                miner_names = [mask_hotkey(m) if anti_doxx else m for m in miners_list[:2]]
+                miner_display = f"{', '.join(miner_names)}... +{len(miners_list)-2}"
+            st.text(miner_display)
+        
+        with col_count:
+            st.text(str(int(row["count"])))
+        
+        with col_msg:
+            if show_normalized:
+                msg_display = mask_text_hotkeys(str(row["message_normalized"])) if anti_doxx else str(row["message_normalized"])
+            else:
+                msg_display = mask_text_hotkeys(str(row["message"])) if anti_doxx else str(row["message"])
+            msg_short = msg_display if len(msg_display) <= 120 else msg_display[:117] + "..."
+            st.text(msg_short)
 
     st.markdown("### Text report")
     gen_report = st.button("Generate exceptions report (.txt)", type="primary", width='stretch')
@@ -636,7 +786,7 @@ else:
         time_selection = st.session_state.get("time_selection", {"start": None, "end": None, "active": False})
 
         def _sig_tuple(row: pd.Series) -> Tuple:
-            return tuple(row[c] for c in ["message", "miner_hotkey", "layer"])
+            return (row["message_normalized"],)
         
         sig_to_exid: Dict[Tuple, int] = {}
         for i, row in grouped.iterrows():
@@ -661,17 +811,28 @@ else:
 
         for i, row in grouped.iterrows():
             ex_id = i + 1
-            miner_line = mask_hotkey(str(row["miner_hotkey"])) if anti_doxx else str(row["miner_hotkey"])
-            layer = str(row["layer"])
-            msg = mask_text_hotkeys(str(row["message"])) if anti_doxx else str(row["message"])
-            lines.append(f"EX_ID {ex_id}: count={int(row['count'])} | miner={miner_line} | layer={layer}")
-            lines.append(f"message: {msg}")
+            
+            miners_list = row["miner_hotkey"]
+            if anti_doxx:
+                miners_display = f"{len(miners_list)} miner(s)"
+            else:
+                if len(miners_list) <= 5:
+                    miners_display = ", ".join(miners_list)
+                else:
+                    miners_display = ", ".join(miners_list[:5]) + f" (+{len(miners_list)-5} more)"
+            
+            msg_norm = mask_text_hotkeys(str(row["message_normalized"])) if anti_doxx else str(row["message_normalized"])
+            msg_example = mask_text_hotkeys(str(row["message"])) if anti_doxx else str(row["message"])
+            
+            lines.append(f"EX_ID {ex_id}: count={int(row['count'])} | miners={miners_display}")
+            lines.append(f"Normalized: {msg_norm}")
+            lines.append(f"Example: {msg_example}")
             lines.append("")
 
         lines.append("== Full exceptions ==")
         exc_sorted = exc_df.sort_values("ts_local")
         keep_chunks = []
-        for _, g in exc_sorted.groupby(group_cols, dropna=False):
+        for _, g in exc_sorted.groupby(group_cols_norm, dropna=False):
             keep_chunks.append(g.tail(10) if len(g) > 10 else g)
         exc_filtered = pd.concat(keep_chunks).sort_values("ts_local")
         
@@ -683,7 +844,7 @@ else:
         prog = st.progress(0, text="Gathering context from log files…")
 
         for idx, r in exc_filtered.reset_index(drop=True).iterrows():
-            key = tuple((r[c] if pd.notna(r[c]) else "") for c in group_cols)
+            key = (r["message_normalized"] if pd.notna(r["message_normalized"]) else "",)
             ex_id = sig_to_exid.get(key, -1)
             level_val = str(r.get("level", ""))
 
@@ -701,7 +862,7 @@ else:
                 lines.append("(context unavailable — header not found in logs)")
                 flat_msg = mask_text_hotkeys(str(r["message"])) if anti_doxx else str(r["message"])
                 miner_line = mask_hotkey(str(r["miner_hotkey"])) if anti_doxx else str(r["miner_hotkey"])
-                lines.append(f"{r['ts_local']} | miner={miner_line} | layer={r['layer']} | message={flat_msg}")
+                lines.append(f"{r['ts_local']} | miner={miner_line} | message={flat_msg}")
                 lines.append("")
             else:
                 lines.append(f"(source: {src_name})")
