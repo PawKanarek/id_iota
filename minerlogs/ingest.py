@@ -18,7 +18,10 @@ def ingest_uploaded_files(
     rx = _RegexBundle()
     total_files = 0
     total_lines = 0
-    counters_sum: Dict[str, int] = {"backward": 0, "forward": 0, "loss": 0, "states": 0, "exceptions": 0}
+    counters_sum: Dict[str, int] = {
+        "backward": 0, "loss": 0, "states": 0, 
+        "exceptions": 0, "optimization": 0, "resource": 0, "registration": 0
+    }
 
     for idx, uf in enumerate(uploaded_files, start=1):
         name = getattr(uf, "name", f"uploaded_{idx}")
@@ -34,7 +37,8 @@ def ingest_uploaded_files(
             text=text,
             tz_name=tz_name,
             rx=rx,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            source_file=name
         )
         total_files += 1
         total_lines += n_lines
@@ -51,11 +55,15 @@ def _ingest_stream(
     tz_name: str,
     rx: "._RegexBundle",
     progress_callback: Optional[Callable[[str], None]],
+    source_file: str = "",
 ) -> Tuple[int, int, dict]:
     tz_local = ZoneInfo(tz_name)
     miners_cache: set[str] = set()
     last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
-    counters = {"backward": 0, "forward": 0, "loss": 0, "states": 0, "exceptions": 0}
+    counters = {
+        "backward": 0, "loss": 0, "states": 0, 
+        "exceptions": 0, "optimization": 0, "resource": 0, "registration": 0
+    }
 
     n_lines = 0
     cur = conn.cursor()
@@ -97,33 +105,25 @@ def _ingest_stream(
                 counters["backward"] += 1
                 continue
 
-            mf = rx.forward_activation.search(msg)
-            if mf:
-                activation_id = mf.group(1)
-                cur.execute(
-                    "INSERT INTO forward_events (miner_hotkey, layer, ts, activation_id) VALUES (?, ?, ?, ?)",
-                    (miner or "", _int_or_none(layer), ts_utc_iso, activation_id),
-                )
-                counters["forward"] += 1
-                continue
-
             ml = rx.loss.search(msg)
             if ml:
                 loss = float(ml.group("loss"))
-                if not miner:
-                    mminer = rx.msg_miner.search(msg)
-                    if mminer:
-                        miner = mminer.group("miner")
-                        if miner and miner not in miners_cache:
-                            cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner,))
-                            miners_cache.add(miner)
-                if layer is None:
-                    mlayer = rx.msg_layer.search(msg)
-                    if mlayer:
-                        layer = int(mlayer.group("layer"))
+                activation_id = ml.group("activation") if ml.lastindex >= 2 else None
+                layer_loss = _int_or_none(ml.group("layer")) if ml.lastindex >= 3 else None
+                miner_loss = ml.group("miner") if ml.lastindex >= 4 else None
+                
+                if not miner_loss:
+                    miner_loss = miner
+                if not layer_loss:
+                    layer_loss = _int_or_none(layer)
+                    
+                if miner_loss and miner_loss not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_loss,))
+                    miners_cache.add(miner_loss)
+                    
                 cur.execute(
-                    "INSERT INTO loss_events (miner_hotkey, layer, ts, loss) VALUES (?, ?, ?, ?)",
-                    (miner or "", _int_or_none(layer), ts_utc_iso, loss),
+                    "INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)",
+                    (miner_loss or "", layer_loss, ts_utc_iso, loss, activation_id),
                 )
                 counters["loss"] += 1
                 continue
@@ -145,6 +145,100 @@ def _ingest_stream(
                 counters["states"] += 1
                 continue
 
+            mopt = rx.optimization_step.search(msg)
+            if mopt:
+                miner_opt = mopt.group("miner")
+                backwards = int(mopt.group("backwards"))
+                step_num = None
+                miner_eff = miner or miner_opt
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)",
+                    (miner_eff or "", _int_or_none(layer), ts_utc_iso, step_num, backwards),
+                )
+                counters["optimization"] += 1
+                continue
+
+            mopt_complete = rx.optimization_complete.search(msg)
+            if mopt_complete:
+                miner_opt = mopt_complete.group("miner")
+                step_num = int(mopt_complete.group("step"))
+                miner_eff = miner or miner_opt
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)",
+                    (miner_eff or "", _int_or_none(layer), ts_utc_iso, step_num, None),
+                )
+                counters["optimization"] += 1
+                continue
+
+            mgpu = rx.gpu_memory.search(msg)
+            if mgpu:
+                memory_gb = float(mgpu.group("memory"))
+                event_type = "gpu_memory"
+                miner_eff = miner
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)",
+                    (miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, memory_gb, None),
+                )
+                counters["resource"] += 1
+                continue
+
+            mgpu_usage = rx.gpu_memory_usage.search(msg)
+            if mgpu_usage:
+                used_gb = float(mgpu_usage.group("used"))
+                total_gb = float(mgpu_usage.group("total"))
+                event_type = "gpu_memory_usage"
+                miner_eff = miner
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)",
+                    (miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, used_gb, f"{used_gb}/{total_gb}"),
+                )
+                counters["resource"] += 1
+                continue
+
+            mcache = rx.cache_full.search(msg)
+            if mcache:
+                miner_cache = mcache.group("miner")
+                count = int(mcache.group("count"))
+                event_type = "cache_full"
+                miner_eff = miner or miner_cache
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)",
+                    (miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, None, str(count)),
+                )
+                counters["resource"] += 1
+                continue
+
+            mreg = rx.registration_success.search(msg)
+            if mreg:
+                miner_reg = mreg.group("miner")
+                layer_reg = int(mreg.group("layer"))
+                epoch = int(mreg.group("epoch"))
+                miner_eff = miner or miner_reg
+                if miner_eff and miner_eff not in miners_cache:
+                    cur.execute("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                cur.execute(
+                    "INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)",
+                    (miner_eff or "", layer_reg, ts_utc_iso, epoch, "registered"),
+                )
+                counters["registration"] += 1
+                continue
+
             if level in ("ERROR", "CRITICAL"):
                 ex_type, http_endpoint, http_code = _extract_exception_bits(rx, msg)
                 cleaned_msg = _clean_message(msg)
@@ -153,11 +247,11 @@ def _ingest_stream(
                     continue
                 
                 normalized_msg = _normalize_exception_message(cleaned_msg)
-                
+
                 cur.execute(
-                    "INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg),
+                    "INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg, n_lines, source_file),
                 )
                 counters["exceptions"] += 1
                 continue
@@ -342,12 +436,46 @@ class _RegexBundle:
             re.IGNORECASE,
         )
 
-        self.forward_activation = re.compile(r"🚀 Starting FORWARD pass.*?activation\s+([a-f0-9\-]+)")
-
-        self.loss = re.compile(r"Computed loss\s+(?P<loss>[0-9]*\.?[0-9]+)", re.IGNORECASE)
+        self.loss = re.compile(
+            r"(?:📊\s*)?Computed loss\s+(?P<loss>[0-9]*\.?[0-9]+)"
+            r"(?:\s+for activation\s+(?P<activation>[a-f0-9\-]+))?"
+            r"(?:[^|]*?\bLayer:\s*(?P<layer>\d+))?"
+            r"(?:[^|]*?\bMiner:\s*(?P<miner>[A-Za-z0-9]+))?",
+            re.IGNORECASE
+        )
 
         self.state_line = re.compile(
-            r"Miner\s+(?P<miner>[A-Za-z0-9]+)\s+in Layer\s+(?P<layer>\d+)\s+is in state:\s+LayerPhase\.(?P<state>[A-Z_]+)",
+            r"Miner\s+(?P<miner>[A-Za-z0-9]+)\s+in Layer\s+(?P<layer>\d+)\s+is in state:\s+(?:LayerPhase\.)?(?P<state>[A-Z_]+)",
+            re.IGNORECASE,
+        )
+
+        self.optimization_step = re.compile(
+            r"Miner\s+(?P<miner>[A-Za-z0-9]+)\s+performing local optimization step after\s+(?P<backwards>\d+)\s+backward",
+            re.IGNORECASE,
+        )
+
+        self.optimization_complete = re.compile(
+            r"(?:✅\s*)?Miner\s+(?P<miner>[A-Za-z0-9]+)\s+completed local optimization step\s+#?(?P<step>\d+)",
+            re.IGNORECASE,
+        )
+
+        self.gpu_memory = re.compile(
+            r"💾\s*GPU memory:\s*(?P<memory>[0-9]*\.?[0-9]+)\s*GB",
+            re.IGNORECASE,
+        )
+
+        self.gpu_memory_usage = re.compile(
+            r"GPU memory usage:\s*(?P<used>[0-9]*\.?[0-9]+)\s*GB\s*/\s*(?P<total>[0-9]*\.?[0-9]+)\s*GB",
+            re.IGNORECASE,
+        )
+
+        self.cache_full = re.compile(
+            r"Miner\s+(?P<miner>[A-Za-z0-9]+)\s+cache full with\s+(?P<count>\d+)\s+activations",
+            re.IGNORECASE,
+        )
+
+        self.registration_success = re.compile(
+            r"✅\s*Miner\s+(?P<miner>[A-Za-z0-9]+)\s+registered successfully in layer\s+(?P<layer>\d+)\s+on training epoch\s+(?P<epoch>\d+)",
             re.IGNORECASE,
         )
 

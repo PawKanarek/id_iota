@@ -8,6 +8,10 @@ import tempfile
 import atexit
 import zipfile
 import io
+import os
+import glob
+import base64
+import html
 from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from datetime import datetime
@@ -17,16 +21,16 @@ import plotly.graph_objects as go
 import streamlit as st
 from bisect import bisect_left
 from minerlogs.timeutil import parse_log_datetime
+import bittensor as bt
 
 from minerlogs.db import ensure_schema, get_connection, migrate_normalize_messages
 from minerlogs.ingest import ingest_uploaded_files
 from minerlogs.queries import (
     list_miners,
     query_backward_events,
-    query_forward_events,
     query_losses,
-    query_states,
     query_exceptions,
+    query_resource_events,
     build_last_seen_summary,
 )
 
@@ -81,37 +85,68 @@ def _find_exception_line_and_context(
     file_paths: List[Path],
     pre_lines: int = 100,
     post_lines: int = 25,
-) -> Tuple[Optional[str], List[str], List[str]]:
-    if "report_index" not in st.session_state:
-        with st.spinner("Indexing log files for context extraction..."):
-            st.session_state["report_index"] = _build_header_indices(file_paths)
-    
+) -> Tuple[Optional[str], List[str], List[str], Optional[int]]:
+    """Find exception line and return (filename, before_lines, after_lines, line_number)"""
     idx_pack = st.session_state.get("report_index", [])
     key = _ts_key(ts_local.to_pydatetime())
-    msg_prefix = (message or "").strip()[:80]
-    
+
+    # Use multiple parts of message for better matching
+    msg_parts = []
+    if message:
+        msg_clean = message.strip()
+        # Try to extract distinctive parts
+        if len(msg_clean) > 20:
+            msg_parts.append(msg_clean[:40])  # First 40 chars
+        if len(msg_clean) > 80:
+            msg_parts.append(msg_clean[40:80])  # Middle part
+        if len(msg_clean) <= 20:
+            msg_parts.append(msg_clean)
+
     for idxf in idx_pack:
         keys = idxf["keys"]
         if not keys:
             continue
         pos = bisect_left(keys, key)
-        start = max(0, pos - 3)
-        stop = min(len(keys), pos + 4)
+        # Search in a wider window around the timestamp
+        start = max(0, pos - 5)
+        stop = min(len(keys), pos + 6)
+
+        best_match = None
+        best_score = 0
+
         for j in range(start, stop):
+            # Must match timestamp and level
             if keys[j] != key or idxf["levels"][j] != level:
                 continue
+
             lines = _load_file_lines(idxf["path"])
             if not lines:
                 continue
+
             li = idxf["line_idx"][j]
             line = lines[li]
-            if msg_prefix and msg_prefix not in line:
-                continue
-            s = max(0, li - pre_lines)
-            e = min(len(lines), li + 1 + post_lines)
-            return idxf["name"], lines[s:li], lines[li:e]
-    
-    return None, [], []
+
+            # Score the match quality
+            score = 0
+            if msg_parts:
+                for part in msg_parts:
+                    if part and part in line:
+                        score += len(part)
+
+            # If we have any message match, prefer it
+            if score > best_score:
+                best_score = score
+                best_match = li
+            elif score == 0 and best_match is None:
+                # No message match yet, use first timestamp+level match
+                best_match = li
+
+        if best_match is not None:
+            s = max(0, best_match - pre_lines)
+            e = min(len(lines), best_match + 1 + post_lines)
+            return idxf["name"], lines[s:best_match], lines[best_match:e], best_match + 1
+
+    return None, [], [], None
 
 
 def _build_file_metadata(file_paths: List[Path]) -> Dict[str, Dict[str, Any]]:
@@ -195,6 +230,227 @@ def _count_exceptions_per_filter(df: pd.DataFrame, filters: List[str]) -> Dict[s
     
     return counts
 
+
+def _find_file_containing_exception(
+    ts_local: pd.Timestamp,
+    miner: str,
+    message: str,
+    file_paths: List[Path]
+) -> Optional[Path]:
+    """Find which file contains the exception by timestamp (DEPRECATED - use _match_source_file_to_path instead)"""
+    if "file_metadata" not in st.session_state:
+        return file_paths[0] if file_paths else None
+
+    file_metadata = st.session_state["file_metadata"]
+    target_dt = ts_local.to_pydatetime()
+
+    for fname, meta in file_metadata.items():
+        if meta["min_timestamp"] <= target_dt <= meta["max_timestamp"]:
+            return meta["path"]
+
+    return file_paths[0] if file_paths else None
+
+
+def _match_source_file_to_path(
+    source_file: str,
+    file_paths: List[Path]
+) -> Optional[Path]:
+    """Match a source file name from the database to a full Path object.
+
+    Args:
+        source_file: The filename stored in the database (e.g., "miner.log")
+        file_paths: List of available file paths from session state
+
+    Returns:
+        The matching Path object, or None if not found
+    """
+    if not source_file or not file_paths:
+        return None
+
+    # Direct name match (most common case)
+    for path in file_paths:
+        if path.name == source_file:
+            return path
+
+    # Fallback: check if source_file is a substring of any filename
+    for path in file_paths:
+        if source_file in str(path):
+            return path
+
+    return None
+
+
+def _generate_log_html(
+    file_path: Path,
+    target_timestamp: pd.Timestamp,
+    miner_hotkey: str,
+    anti_doxx: bool,
+    mask_map: Dict[str, str],
+    target_line_number: Optional[int] = None
+) -> str:
+    """Generate HTML file with highlighted exception"""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+    except Exception:
+        return "<html><body><h1>Error loading file</h1></body></html>"
+
+    # Find target line - use provided line number or search
+    target_line_idx = None
+    if target_line_number is not None:
+        # Line numbers are 1-indexed, convert to 0-indexed
+        target_line_idx = target_line_number - 1
+        # Validate line number is within bounds
+        if target_line_idx < 0 or target_line_idx >= len(lines):
+            target_line_idx = None
+
+    # Only use timestamp fallback if no line number was provided at all
+    if target_line_number is None:
+        # Fallback: search by timestamp and miner (for backward compatibility)
+        target_ts_str = target_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+        for idx, line in enumerate(lines):
+            m = HEADER_RX.match(line)
+            if m:
+                line_dt = m.group("dt")
+                if target_ts_str in line_dt and miner_hotkey in line:
+                    target_line_idx = idx
+                    break
+    
+    # Build HTML
+    html_lines = ['''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>''' + file_path.name + '''</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .header {
+            position: sticky;
+            top: 0;
+            background-color: #2d2d2d;
+            padding: 10px;
+            border-bottom: 2px solid #444;
+            margin-bottom: 20px;
+        }
+        .log-line {
+            white-space: pre;
+            line-height: 1.4;
+            padding: 2px 0;
+        }
+        .log-line-number {
+            display: inline-block;
+            width: 60px;
+            color: #858585;
+            text-align: right;
+            margin-right: 15px;
+            user-select: none;
+        }
+        .exception-line {
+            background-color: #5a1e1e;
+            border-left: 4px solid #f48771;
+            padding: 2px;
+            margin-left: -4px;
+        }
+        .exception-line .log-content {
+            background-color: #f48771;
+            color: #1e1e1e;
+            padding: 2px 4px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>''' + file_path.name + '''</h2>
+        <p>File size: ''' + f"{file_path.stat().st_size / (1024*1024):.2f}" + ''' MB | Lines: ''' + str(len(lines)) + '''</p>''']
+    
+    if target_line_idx is not None:
+        html_lines.append(f'        <p>🎯 Exception highlighted at line {target_line_idx + 1}</p>')
+    
+    html_lines.append('    </div>')
+    html_lines.append('    <div class="log-container">')
+    
+    # Add all lines
+    for idx, line in enumerate(lines):
+        line_content = line.rstrip('\n')
+        # Escape HTML
+        line_content = line_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        # Apply anti-doxx masking if needed
+        if anti_doxx:
+            for real, masked in mask_map.items():
+                line_content = line_content.replace(real, masked)
+        
+        line_number = idx + 1
+        is_exception_line = (idx == target_line_idx)
+        
+        if is_exception_line:
+            html_lines.append(
+                f'<div class="log-line exception-line" id="target-line">'
+                f'<span class="log-line-number">{line_number}</span>'
+                f'<span class="log-content">{line_content}</span>'
+                f'</div>'
+            )
+        else:
+            html_lines.append(
+                f'<div class="log-line">'
+                f'<span class="log-line-number">{line_number}</span>'
+                f'{line_content}'
+                f'</div>'
+            )
+    
+    html_lines.append('    </div>')
+    
+    # Add JavaScript to scroll to target line
+    if target_line_idx is not None:
+        html_lines.append('''
+    <script>
+    window.addEventListener('load', function() {
+        var target = document.getElementById('target-line');
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    });
+    </script>''')
+    
+    html_lines.append('</body>')
+    html_lines.append('</html>')
+    
+    return '\n'.join(html_lines)
+
+
+@st.cache_data(ttl=300)
+def fetch_emission_data(network: str = "finney", netuid: int = 9) -> Dict[str, float]:
+    try:
+        subtensor = bt.subtensor(network)
+        metagraph = subtensor.metagraph(netuid, lite=True)
+        
+        emission_map = {}
+        for uid in metagraph.uids.tolist():
+            hotkey = metagraph.hotkeys[uid]
+            emission = metagraph.emission[uid].item() * 20
+            emission_map[hotkey] = emission
+        
+        return emission_map
+    except Exception as e:
+        st.warning(f"Failed to fetch emission data: {e}")
+        return {}
+
+
+def match_hotkey_emission(short_hotkey: str, emission_map: Dict[str, float]) -> Optional[float]:
+    for full_hotkey, emission in emission_map.items():
+        if full_hotkey.startswith(short_hotkey):
+            return emission
+    return None
+
 def cleanup_session():
     temp_dir = st.session_state.get("temp_dir")
     if temp_dir and Path(temp_dir).exists():
@@ -229,7 +485,7 @@ def init_session():
         st.session_state["file_metadata"] = {}
         st.session_state["time_selection"] = {"start": None, "end": None, "active": False}
         st.session_state["filter_expander_open"] = False
-        st.session_state["exception_filters"] = ["Miner is moving state from LayerPhase.TRAINING to LayerPhase.WEIGHTS_UPLOADING"]
+        st.session_state["exception_filters"] = ["Miner is moving state from"]
         
         atexit.register(cleanup_session)
 
@@ -237,17 +493,91 @@ init_session()
 conn = st.session_state["conn"]
 
 with st.sidebar:
+    logs_dir = os.getenv("LOGS_DIR", "")
+    
+    if logs_dir and os.path.isdir(logs_dir):
+        st.info(f"📁 Auto-loading from: `{logs_dir}`")
+        if st.button("Reload logs from folder", type="primary", width='stretch'):
+            log_files = sorted(glob.glob(os.path.join(logs_dir, "**/*.log"), recursive=True))
+            
+            if not log_files:
+                st.warning(f"No .log files found in {logs_dir}")
+            else:
+                conn.execute("DELETE FROM miners")
+                conn.execute("DELETE FROM backward_events")
+                conn.execute("DELETE FROM loss_events")
+                conn.execute("DELETE FROM state_events")
+                conn.execute("DELETE FROM exceptions")
+                conn.execute("DELETE FROM optimization_events")
+                conn.execute("DELETE FROM resource_events")
+                conn.execute("DELETE FROM registration_events")
+                conn.commit()
+                
+                temp_dir = Path(st.session_state["temp_dir"])
+                for old_file in st.session_state.get("uploaded_file_paths", []):
+                    if old_file.exists():
+                        old_file.unlink()
+                
+                file_paths = []
+                uploaded_files = []
+                for log_path in log_files:
+                    with open(log_path, "rb") as f:
+                        content = f.read()
+                    
+                    class FileWrapper:
+                        def __init__(self, name, content):
+                            self.name = name
+                            self._content = content
+                        def getvalue(self):
+                            return self._content
+                    
+                    uploaded_files.append(FileWrapper(os.path.basename(log_path), content))
+                    
+                    dest_path = temp_dir / os.path.basename(log_path)
+                    with open(dest_path, "wb") as f:
+                        f.write(content)
+                    file_paths.append(dest_path)
+                
+                st.session_state["uploaded_file_paths"] = file_paths
+                
+                if "report_index" in st.session_state:
+                    del st.session_state["report_index"]
+
+                with st.spinner("Building file metadata..."):
+                    st.session_state["file_metadata"] = _build_file_metadata(file_paths)
+
+                with st.spinner("Indexing log files for fast context extraction..."):
+                    st.session_state["report_index"] = _build_header_indices(file_paths)
+
+                with st.spinner("Parsing logs..."):
+                    total_files, total_lines, counters = ingest_uploaded_files(
+                        conn=conn,
+                        uploaded_files=uploaded_files,
+                        tz_name=TZ_NAME,
+                        progress_callback=lambda msg: st.sidebar.write(msg),
+                    )
+                st.success(f"Parsed {total_files} file(s), ~{total_lines:,} line(s).")
+                
+                st.write("**Events captured:**")
+                for event_type, count in counters.items():
+                    st.write(f"- {event_type}: {count:,}")
+        
+        st.divider()
+        st.caption("Or upload files manually:")
+    
     uploaded = st.file_uploader("Drop .log files here", type=["log"], accept_multiple_files=True)
-    if st.button("Load uploaded logs", type="primary", width='stretch'):
+    if st.button("Load uploaded logs", type="primary" if not logs_dir else "secondary", width='stretch'):
         if not uploaded:
             st.warning("Please upload at least one log file.")
         else:
             conn.execute("DELETE FROM miners")
             conn.execute("DELETE FROM backward_events")
-            conn.execute("DELETE FROM forward_events")
             conn.execute("DELETE FROM loss_events")
             conn.execute("DELETE FROM state_events")
             conn.execute("DELETE FROM exceptions")
+            conn.execute("DELETE FROM optimization_events")
+            conn.execute("DELETE FROM resource_events")
+            conn.execute("DELETE FROM registration_events")
             conn.commit()
             
             temp_dir = Path(st.session_state["temp_dir"])
@@ -267,10 +597,13 @@ with st.sidebar:
             
             if "report_index" in st.session_state:
                 del st.session_state["report_index"]
-            
+
             with st.spinner("Building file metadata..."):
                 st.session_state["file_metadata"] = _build_file_metadata(file_paths)
-            
+
+            with st.spinner("Indexing log files for fast context extraction..."):
+                st.session_state["report_index"] = _build_header_indices(file_paths)
+
             with st.spinner("Parsing uploaded logs..."):
                 total_files, total_lines, counters = ingest_uploaded_files(
                     conn=conn,
@@ -279,6 +612,10 @@ with st.sidebar:
                     progress_callback=lambda msg: st.sidebar.write(msg),
                 )
             st.success(f"Parsed {total_files} file(s), ~{total_lines:,} line(s).")
+            
+            st.write("**Events captured:**")
+            for event_type, count in counters.items():
+                st.write(f"- {event_type}: {count:,}")
 
 with st.container(horizontal=True):
     st.image(_LOGO, width=177)
@@ -320,13 +657,42 @@ if not selected_miners:
     st.warning("Select at least one miner.")
     st.stop()
 
+emission_map = {}
+col1, col2, col3 = st.columns([1, 1, 2])
+with col1:
+    fetch_emissions = st.checkbox("Fetch emissions", value=False, help="Fetch emission data from blockchain (cached for 5 min)")
+with col2:
+    if fetch_emissions:
+        netuid = st.number_input("NetUID", value=9, min_value=1, max_value=100, step=1)
+with col3:
+    if fetch_emissions:
+        network = st.selectbox("Network", ["finney", "test"], index=0)
+
+if fetch_emissions:
+    with st.spinner("Fetching emission data from blockchain..."):
+        emission_map = fetch_emission_data(network, netuid)
+    if emission_map:
+        st.success(f"✅ Loaded emissions for {len(emission_map)} hotkeys")
+
 st.divider()
 
 summary_df = build_last_seen_summary(conn, TZ_NAME, miners=selected_miners)
 if not summary_df.empty:
+    if emission_map:
+        summary_df["emission"] = summary_df["miner_hotkey"].apply(
+            lambda hk: match_hotkey_emission(hk, emission_map)
+        )
+        summary_df["emission"] = summary_df["emission"].fillna(0.0)
+        summary_df["emission"] = summary_df["emission"].round(2)
+    
     if anti_doxx:
         summary_df = summary_df.copy()
         summary_df["miner_hotkey"] = summary_df["miner_hotkey"].map(mask_hotkey)
+    
+    if emission_map:
+        column_order = ["miner_hotkey", "last_layer", "last_state", "last_seen", "emission"]
+        summary_df = summary_df[column_order]
+    
     st.dataframe(
         summary_df.reset_index(drop=True),
         hide_index=True,
@@ -338,9 +704,8 @@ else:
 st.divider()
 
 bw_df = query_backward_events(conn, TZ_NAME, miners=selected_miners)
-fw_df = query_forward_events(conn, TZ_NAME, miners=selected_miners)
 loss_df = query_losses(conn, TZ_NAME, miners=selected_miners)
-state_df = query_states(conn, TZ_NAME, miners=selected_miners)
+res_df = query_resource_events(conn, TZ_NAME, miners=selected_miners)
 
 time_selection = st.session_state.get("time_selection", {"start": None, "end": None, "active": False})
 time_range = None
@@ -377,13 +742,51 @@ def _plot_filter(df: pd.DataFrame) -> pd.DataFrame:
     return df[msk].copy()
 
 bw_plot = _plot_filter(bw_df)
-fw_plot = _plot_filter(fw_df)
 loss_plot = _plot_filter(loss_df)
 
-if bw_plot.empty and fw_plot.empty:
-    st.info("No backward or forward events found for selected miners.")
+all_layers_available = set()
+if not bw_plot.empty:
+    all_layers_available.update(bw_plot["layer"].dropna().unique())
+if not loss_plot.empty:
+    all_layers_available.update(loss_plot["layer"].dropna().unique())
+all_layers_available = sorted([int(l) for l in all_layers_available if pd.notna(l)])
+
+if "selected_layers" not in st.session_state:
+    st.session_state["selected_layers"] = set(all_layers_available)
+
+if all_layers_available:
+    st.markdown("**Filter by layer:**")
+    cols = st.columns(len(all_layers_available))
+    
+    for idx, layer in enumerate(all_layers_available):
+        with cols[idx]:
+            checked = layer in st.session_state["selected_layers"]
+            new_checked = st.checkbox(f"Layer{layer}", value=checked, key=f"layer_cb_{layer}")
+            if new_checked and layer not in st.session_state["selected_layers"]:
+                st.session_state["selected_layers"].add(layer)
+                st.rerun()
+            elif not new_checked and layer in st.session_state["selected_layers"]:
+                st.session_state["selected_layers"].discard(layer)
+                st.rerun()
+
+if not bw_plot.empty:
+    bw_plot = bw_plot[bw_plot["layer"].isin(st.session_state["selected_layers"])]
+if not loss_plot.empty:
+    loss_plot = loss_plot[loss_plot["layer"].isin(st.session_state["selected_layers"])]
+
+if bw_plot.empty and loss_plot.empty:
+    st.info("No backward or loss events found for selected miners and layers.")
 else:
     fig = go.Figure()
+    
+    color_map = {}
+    color_palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    miner_idx = 0
+    
+    for miner in sorted(bw_plot["miner_hotkey"].unique()):
+        if miner not in color_map:
+            color_map[miner] = color_palette[miner_idx % len(color_palette)]
+            miner_idx += 1
 
     for miner, mdf in bw_plot.groupby("miner_hotkey"):
         mdf = mdf.sort_values("ts_local")
@@ -392,32 +795,18 @@ else:
         raw_label = mask_map_full.get(miner, miner) if anti_doxx else miner
         label = raw_label if (isinstance(raw_label, str) and raw_label.strip()) else "unknown"
 
-        fig.add_trace(
-            go.Scatter(
-                x=mdf["ts_local"],
-                y=mdf["since_reset"],
-                mode="lines+markers",
-                name=f"{label} (backward)",
-                hovertemplate="%{x}<br>backwards_since_reset=%{y}<extra></extra>",
-            )
-        )
-
-    if not fw_plot.empty:
-        for miner, fdf in fw_plot.groupby("miner_hotkey"):
-            fdf = fdf.sort_values("ts_local")
-            raw_label = mask_map_full.get(miner, miner) if anti_doxx else miner
-            label = raw_label if (isinstance(raw_label, str) and raw_label.strip()) else "unknown"
-            
-            y_values = list(range(len(fdf)))
-            
+        for layer in mdf["layer"].dropna().unique():
+            layer_data = mdf[mdf["layer"] == layer]
             fig.add_trace(
                 go.Scatter(
-                    x=fdf["ts_local"],
-                    y=y_values,
-                    mode="markers",
-                    name=f"{label} (forward)",
-                    marker=dict(size=2),
-                    hovertemplate="%{x}<br>forward_count=%{y}<extra></extra>",
+                    x=layer_data["ts_local"],
+                    y=layer_data["since_reset"],
+                    mode="lines+markers",
+                    name=f"{label} (L{int(layer)})",
+                    legendgroup=f"layer_{int(layer)}",
+                    line=dict(color=color_map[miner]),
+                    marker=dict(color=color_map[miner]),
+                    hovertemplate="%{x}<br>backwards_since_reset=%{y}<extra></extra>",
                 )
             )
 
@@ -427,17 +816,20 @@ else:
             raw_label = mask_map_full.get(miner, miner) if anti_doxx else miner
             label = raw_label if (isinstance(raw_label, str) and raw_label.strip()) else "unknown"
 
-            fig.add_trace(
-                go.Scatter(
-                    x=ldf["ts_local"],
-                    y=ldf["loss"],
-                    mode="markers",
-                    name=f"{label} (loss)",
-                    yaxis="y2",
-                    marker=dict(symbol="circle-open"),
-                    hovertemplate="%{x}<br>loss=%{y:.4f}<extra></extra>",
+            for layer in ldf["layer"].dropna().unique():
+                layer_data = ldf[ldf["layer"] == layer]
+                fig.add_trace(
+                    go.Scatter(
+                        x=layer_data["ts_local"],
+                        y=layer_data["loss"],
+                        mode="markers",
+                        name=f"{label} (L{int(layer)} loss)",
+                        legendgroup=f"layer_{int(layer)}",
+                        yaxis="y2",
+                        marker=dict(symbol="circle-open", size=8, line=dict(width=2, color=color_map.get(miner, color_palette[0]))),
+                        hovertemplate="%{x}<br>loss=%{y:.4f}<extra></extra>",
+                    )
                 )
-            )
 
     if not exc_df.empty:
         fig.update_layout(
@@ -461,7 +853,7 @@ else:
                 y=[0.05] * len(exc_df),
                 mode="markers",
                 name="exceptions",
-                marker=dict(symbol="x", size=10),
+                marker=dict(symbol="x", size=10, color="red"),
                 hovertemplate=("time=%{x}<br>miner=%{customdata[0]}<br>message=%{customdata[1]}<extra></extra>"),
                 customdata=custom,
                 yaxis="y3",
@@ -482,80 +874,13 @@ else:
     layout_kwargs = dict(
         title=None,
         xaxis_title="time",
-        yaxis_title="backwards_since_reset / forward_count",
+        yaxis_title="backwards_since_reset",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=40, r=40, t=40, b=80),
+        margin=dict(l=40, r=40, t=40, b=40),
         dragmode="select",
-        updatemenus=[
-            dict(
-                type="buttons",
-                direction="left",
-                buttons=[
-                    dict(
-                        label="⬤ Backward",
-                        method="restyle",
-                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(backward)" in trace.name]],
-                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(backward)" in trace.name]],
-                    ),
-                ],
-                pad={"r": 10, "t": 5, "b": 5, "l": 10},
-                showactive=False,
-                x=0.15,
-                xanchor="left",
-                y=-0.15,
-                yanchor="top",
-                bgcolor="rgba(0, 0, 0, 0)",
-                bordercolor="rgba(0, 0, 0, 0)",
-                borderwidth=0,
-                font=dict(size=11),
-            ),
-            dict(
-                type="buttons",
-                direction="left",
-                buttons=[
-                    dict(
-                        label="⬤ Forward",
-                        method="restyle",
-                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(forward)" in trace.name]],
-                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(forward)" in trace.name]],
-                    ),
-                ],
-                pad={"r": 10, "t": 5, "b": 5, "l": 10},
-                showactive=False,
-                x=0.42,
-                xanchor="left",
-                y=-0.15,
-                yanchor="top",
-                bgcolor="rgba(0, 0, 0, 0)",
-                bordercolor="rgba(0, 0, 0, 0)",
-                borderwidth=0,
-                font=dict(size=11),
-            ),
-            dict(
-                type="buttons",
-                direction="left",
-                buttons=[
-                    dict(
-                        label="⬤ Loss",
-                        method="restyle",
-                        args=[{"visible": False}, [i for i, trace in enumerate(fig.data) if "(loss)" in trace.name]],
-                        args2=[{"visible": True}, [i for i, trace in enumerate(fig.data) if "(loss)" in trace.name]],
-                    ),
-                ],
-                pad={"r": 10, "t": 5, "b": 5, "l": 10},
-                showactive=False,
-                x=0.65,
-                xanchor="left",
-                y=-0.15,
-                yanchor="top",
-                bgcolor="rgba(0, 0, 0, 0)",
-                bordercolor="rgba(0, 0, 0, 0)",
-                borderwidth=0,
-                font=dict(size=11),
-            ),
-        ]
     )
+    
     if not loss_plot.empty:
         fig.update_layout(
             **layout_kwargs,
@@ -639,8 +964,31 @@ else:
             else:
                 st.warning("No log files found in selected time range")
 
-filter_counts = _count_exceptions_per_filter(exc_df_raw, st.session_state["exception_filters"])
 st.divider()
+
+st.subheader("GPU Memory Usage")
+
+if not res_df.empty:
+    gpu_df = res_df[res_df["event_type"].isin(["gpu_memory", "gpu_memory_usage"])]
+    
+    if not gpu_df.empty:
+        peak_memory = gpu_df.groupby("miner_hotkey")["value_gb"].max().sort_values(ascending=False)
+        
+        if not peak_memory.empty:
+            st.markdown("**Peak GPU Memory Usage:**")
+            for miner, peak_gb in peak_memory.items():
+                display_miner = mask_hotkey(miner) if anti_doxx else miner
+                st.write(f"• **{display_miner}**: {peak_gb:.2f} GB")
+        else:
+            st.info("No GPU memory data available")
+    else:
+        st.info("No GPU memory events captured")
+else:
+    st.info("No resource events captured")
+
+st.divider()
+
+filter_counts = _count_exceptions_per_filter(exc_df_raw, st.session_state["exception_filters"])
 
 expander_open = st.session_state.get("filter_expander_open", False)
 
@@ -715,13 +1063,13 @@ else:
         help="Normalized messages replace variable parts (UUIDs, IDs, timestamps) with placeholders for better grouping"
     )
     
-    group_cols_norm = ["message_normalized"]
+    # Always group by message_normalized only (removed category grouping)
     grouped = (
-        exc_df.groupby(group_cols_norm, dropna=False)
+        exc_df.groupby("message_normalized", dropna=False)
         .agg({
             "message": "first",
             "miner_hotkey": lambda x: list(x.unique()),
-            "ts_local": "count"
+            "ts_local": "count",
         })
         .rename(columns={"ts_local": "count"})
         .reset_index()
@@ -729,28 +1077,47 @@ else:
         .reset_index(drop=True)
     )
     
-    st.markdown("**Click 🚫 to filter out exception types:**")
-    
-    col_btn, col_miners, col_count, col_msg = st.columns([0.4, 1.5, 0.6, 5.0])
+    st.markdown("**Click 🚫 to filter, ▼ to expand and view individual exceptions:**")
+
+    col_btn, col_expand, col_miners, col_count, col_msg = st.columns([0.4, 0.4, 1.5, 0.6, 5.1])
     with col_btn:
         st.markdown("**🚫**")
+    with col_expand:
+        st.markdown("**▼**")
     with col_miners:
         st.markdown("**Miners**")
     with col_count:
         st.markdown("**Count**")
     with col_msg:
         st.markdown("**Message**")
+
+    # Note: source_file is shown in the expanded view for each individual exception
+    
+    # Get file paths for linking
+    file_paths = st.session_state.get("uploaded_file_paths", [])
     
     for idx, row in grouped.iterrows():
-        col_btn, col_miners, col_count, col_msg = st.columns([0.4, 1.5, 0.6, 5.0])
+        # Get all occurrences of this exception for the expandable section
+        matching_exceptions = exc_df[exc_df["message_normalized"] == row["message_normalized"]].copy()
+        matching_exceptions = matching_exceptions.sort_values("ts_local", ascending=False)
+        
+        col_btn, col_expand, col_miners, col_count, col_msg = st.columns([0.4, 0.4, 1.5, 0.6, 5.1])
         
         with col_btn:
             filter_key = f"filter_{idx}"
-            if st.button("🚫", key=filter_key, help="Add to filters"):
+            if st.button("🚫", key=filter_key, help="Add to filters", use_container_width=False):
                 filter_text = str(row["message_normalized"])
                 if filter_text not in st.session_state["exception_filters"]:
                     st.session_state["exception_filters"].append(filter_text)
                     st.rerun()
+        
+        with col_expand:
+            expand_key = f"expand_{idx}"  # button widget key
+            expand_state_key = f"expand_state_{idx}"  # separate state storage key
+            is_expanded = st.session_state.get(expand_state_key, False)
+            if st.button("▼" if not is_expanded else "▲", key=expand_key, help="Expand to see individual exceptions", use_container_width=False):
+                st.session_state[expand_state_key] = not is_expanded
+                st.rerun()
         
         with col_miners:
             miners_list = row["miner_hotkey"]
@@ -772,6 +1139,163 @@ else:
                 msg_display = mask_text_hotkeys(str(row["message"])) if anti_doxx else str(row["message"])
             msg_short = msg_display if len(msg_display) <= 120 else msg_display[:117] + "..."
             st.text(msg_short)
+        
+        # Show individual exceptions if expanded
+        if st.session_state.get(expand_state_key, False):
+            with st.container(border=True):
+                st.caption(f"Individual occurrences ({len(matching_exceptions)} total):")
+
+                # Limit to first 50 for performance
+                display_count = min(50, len(matching_exceptions))
+
+                # Column headers for expanded view
+                col1_h, col2_h, col3_h, col4_h, col5_h = st.columns([0.5, 1.8, 1.5, 0.8, 3.4])
+                with col1_h:
+                    st.caption("**View**")
+                with col2_h:
+                    st.caption("**Timestamp**")
+                with col3_h:
+                    st.caption("**Miner**")
+                with col4_h:
+                    st.caption("**Line**")
+                with col5_h:
+                    st.caption("**Message**")
+
+                for exc_idx, exc_row in matching_exceptions.head(display_count).iterrows():
+                    col1, col2, col3, col4, col5 = st.columns([0.5, 1.8, 1.5, 0.8, 3.4])
+
+                    # Get line number and source file from database
+                    line_num = exc_row.get("line_number")
+                    source_file = exc_row.get("source_file", "")
+
+                    with col1:
+                        # Use source_file from database instead of timestamp-based search
+                        file_found = _match_source_file_to_path(source_file, file_paths)
+
+                        # Fallback to old method if source_file is missing
+                        if not file_found:
+                            file_found = _find_file_containing_exception(
+                                exc_row["ts_local"],
+                                exc_row["miner_hotkey"],
+                                str(exc_row.get("message", "")),
+                                file_paths
+                            )
+
+                        if file_found and file_found.exists():
+                            # Show filename as text with button to view
+                            log_filename = file_found.name
+
+                            # Create unique key for modal state
+                            modal_key = f"show_log_{idx}_{exc_idx}"
+                            button_key = f"view_exp_{idx}_{exc_idx}"
+
+                            # Show button with source file info in tooltip
+                            tooltip = f"View log: {source_file} (line {line_num})" if source_file else f"View log (line {line_num})"
+                            if st.button("📋", key=button_key, help=tooltip):
+                                st.session_state[modal_key] = True
+                                # Store line number, source file, and the resolved path for viewer
+                                st.session_state[f"line_num_{modal_key}"] = line_num
+                                st.session_state[f"source_file_{modal_key}"] = source_file
+                                st.session_state[f"resolved_path_{modal_key}"] = file_found
+                        elif source_file:
+                            # File not found - show warning instead of button
+                            st.caption(f"⚠️ {source_file[:10]}...")
+
+                    with col2:
+                        st.text(exc_row["ts_local"].strftime("%Y-%m-%d %H:%M:%S"))
+
+                    with col3:
+                        miner_display = mask_hotkey(exc_row["miner_hotkey"]) if anti_doxx else exc_row["miner_hotkey"]
+                        st.text(miner_display)
+
+                    with col4:
+                        st.text(f"L{line_num}" if line_num else "-")
+
+                    with col5:
+                        msg_display = mask_text_hotkeys(str(exc_row["message"])) if anti_doxx else str(exc_row["message"])
+                        msg_short = msg_display if len(msg_display) <= 80 else msg_display[:77] + "..."
+                        st.text(msg_short)
+                
+                if len(matching_exceptions) > display_count:
+                    st.caption(f"Showing first {display_count} of {len(matching_exceptions)} occurrences")
+
+    # Display log viewer modal if any log was clicked
+    file_paths = st.session_state.get("uploaded_file_paths", [])
+    for idx, row in grouped.iterrows():
+        matching_exceptions = exc_df[exc_df["message_normalized"] == row["message_normalized"]].copy()
+        matching_exceptions = matching_exceptions.sort_values("ts_local", ascending=False)
+        display_count = min(50, len(matching_exceptions))
+
+        for exc_idx, exc_row in matching_exceptions.head(display_count).iterrows():
+            modal_key = f"show_log_{idx}_{exc_idx}"
+
+            if st.session_state.get(modal_key, False):
+                # Get line number, source file, and resolved path from session state
+                line_num = st.session_state.get(f"line_num_{modal_key}")
+                source_file = st.session_state.get(f"source_file_{modal_key}", "")
+                file_found = st.session_state.get(f"resolved_path_{modal_key}")
+
+                # If we don't have a cached path, try to resolve it again
+                if not file_found:
+                    file_found = _match_source_file_to_path(source_file, file_paths)
+
+                    # Fallback to old method if source_file is missing
+                    if not file_found:
+                        file_found = _find_file_containing_exception(
+                            exc_row["ts_local"],
+                            exc_row["miner_hotkey"],
+                            str(exc_row.get("message", "")),
+                            file_paths
+                        )
+
+                if file_found and file_found.exists():
+                    st.markdown("---")
+                    st.markdown(f"### 📋 Viewing: {file_found.name}" + (f" (line {line_num})" if line_num else ""))
+
+                    col1, col2 = st.columns([6, 1])
+                    with col2:
+                        if st.button("Close", key=f"close_{modal_key}"):
+                            del st.session_state[modal_key]
+                            st.rerun()
+
+                    html_content = _generate_log_html(
+                        file_found,
+                        exc_row["ts_local"],
+                        exc_row["miner_hotkey"],
+                        anti_doxx,
+                        mask_map_full,
+                        target_line_number=line_num
+                    )
+
+                    # Display in iframe with unique ID for scrolling
+                    iframe_html = f'<div id="log_viewer_{idx}_{exc_idx}">{html_content}</div>'
+                    st.components.v1.html(iframe_html, height=800, scrolling=True)
+
+                    # Add JavaScript to scroll to the viewer
+                    st.markdown(
+                        f"""
+                        <script>
+                            setTimeout(function() {{
+                                var viewer = document.getElementById('log_viewer_{idx}_{exc_idx}');
+                                if (viewer) {{
+                                    viewer.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                                }}
+                            }}, 100);
+                        </script>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    st.markdown("---")
+                else:
+                    # File not found or doesn't exist
+                    st.markdown("---")
+                    st.error(f"❌ Cannot display log viewer: File '{source_file}' not found or no longer exists.")
+                    st.caption(f"Expected file: {source_file}")
+                    st.caption(f"Available files: {', '.join(p.name for p in file_paths)}")
+                    if st.button("Close", key=f"close_error_{modal_key}"):
+                        del st.session_state[modal_key]
+                        st.rerun()
+                    st.markdown("---")
 
     st.markdown("### Text report")
     gen_report = st.button("Generate exceptions report (.txt)", type="primary", width='stretch')
@@ -832,7 +1356,7 @@ else:
         lines.append("== Full exceptions ==")
         exc_sorted = exc_df.sort_values("ts_local")
         keep_chunks = []
-        for _, g in exc_sorted.groupby(group_cols_norm, dropna=False):
+        for _, g in exc_sorted.groupby("message_normalized", dropna=False):
             keep_chunks.append(g.tail(10) if len(g) > 10 else g)
         exc_filtered = pd.concat(keep_chunks).sort_values("ts_local")
         
@@ -848,7 +1372,7 @@ else:
             ex_id = sig_to_exid.get(key, -1)
             level_val = str(r.get("level", ""))
 
-            src_name, before, after = _find_exception_line_and_context(
+            src_name, before, after, line_num = _find_exception_line_and_context(
                 ts_local=r["ts_local"],
                 level=level_val,
                 message=str(r.get("message", "")),

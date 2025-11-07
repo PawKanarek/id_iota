@@ -36,3 +36,4 @@ logs/
 # Build artifacts
 dist/
 build/
+log_templates_report.txt

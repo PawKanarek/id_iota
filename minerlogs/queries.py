@@ -45,31 +45,10 @@ def query_backward_events(conn: sqlite3.Connection, tz_name: str, miners: Option
     return df
 
 
-def query_forward_events(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
-    df = pd.read_sql_query(
-        """
-        SELECT miner_hotkey, layer, ts AS ts_iso, activation_id
-        FROM forward_events
-        ORDER BY ts ASC
-        """,
-        conn,
-    )
-    if df.empty:
-        return df
-
-    df = _maybe_filter_miners(df, miners)
-    if df.empty:
-        return df
-
-    df["ts_local"] = _to_naive_local(df["ts_iso"], tz_name)
-    df = df[df["ts_local"].notna()]
-    return df
-
-
 def query_losses(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
     df = pd.read_sql_query(
         """
-        SELECT miner_hotkey, layer, ts AS ts_iso, loss
+        SELECT miner_hotkey, layer, ts AS ts_iso, loss, activation_id
         FROM loss_events
         ORDER BY ts ASC
         """,
@@ -122,7 +101,7 @@ def query_exceptions(
 ) -> pd.DataFrame:
     df = pd.read_sql_query(
         """
-        SELECT miner_hotkey, layer, ts AS ts_iso, ex_type, level, http_endpoint, http_code, message, message_normalized
+        SELECT miner_hotkey, layer, ts AS ts_iso, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file
         FROM exceptions
         ORDER BY ts ASC
         """,
@@ -142,6 +121,69 @@ def query_exceptions(
         start_dt, end_dt = time_range
         df = df[(df["ts_local"] >= start_dt) & (df["ts_local"] <= end_dt)]
 
+    return df
+
+
+def query_optimization_events(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT miner_hotkey, layer, ts AS ts_iso, step_number, backwards_count
+        FROM optimization_events
+        ORDER BY ts ASC
+        """,
+        conn,
+    )
+    if df.empty:
+        return df
+
+    df = _maybe_filter_miners(df, miners)
+    if df.empty:
+        return df
+
+    df["ts_local"] = _to_naive_local(df["ts_iso"], tz_name)
+    df = df[df["ts_local"].notna()]
+    return df
+
+
+def query_resource_events(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT miner_hotkey, layer, ts AS ts_iso, event_type, value_gb, value_text
+        FROM resource_events
+        ORDER BY ts ASC
+        """,
+        conn,
+    )
+    if df.empty:
+        return df
+
+    df = _maybe_filter_miners(df, miners)
+    if df.empty:
+        return df
+
+    df["ts_local"] = _to_naive_local(df["ts_iso"], tz_name)
+    df = df[df["ts_local"].notna()]
+    return df
+
+
+def query_registration_events(conn: sqlite3.Connection, tz_name: str, miners: Optional[List[str]] = None) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT miner_hotkey, layer, ts AS ts_iso, training_epoch, status
+        FROM registration_events
+        ORDER BY ts ASC
+        """,
+        conn,
+    )
+    if df.empty:
+        return df
+
+    df = _maybe_filter_miners(df, miners)
+    if df.empty:
+        return df
+
+    df["ts_local"] = _to_naive_local(df["ts_iso"], tz_name)
+    df = df[df["ts_local"].notna()]
     return df
 
 
