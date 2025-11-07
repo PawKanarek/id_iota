@@ -428,27 +428,30 @@ def _generate_log_html(
 
 
 @st.cache_data(ttl=300)
-def fetch_emission_data(network: str = "finney", netuid: int = 9) -> Dict[str, float]:
+def fetch_emission_data(network: str = "finney", netuid: int = 9) -> Dict[str, Dict[str, float]]:
     try:
         subtensor = bt.subtensor(network)
         metagraph = subtensor.metagraph(netuid, lite=True)
-        
+
         emission_map = {}
         for uid in metagraph.uids.tolist():
             hotkey = metagraph.hotkeys[uid]
             emission = metagraph.emission[uid].item() * 20
-            emission_map[hotkey] = emission
-        
+            emission_map[hotkey] = {
+                "uid": int(uid),
+                "emission": emission
+            }
+
         return emission_map
     except Exception as e:
         st.warning(f"Failed to fetch emission data: {e}")
         return {}
 
 
-def match_hotkey_emission(short_hotkey: str, emission_map: Dict[str, float]) -> Optional[float]:
-    for full_hotkey, emission in emission_map.items():
+def match_hotkey_emission(short_hotkey: str, emission_map: Dict[str, Dict[str, float]]) -> Optional[Dict[str, float]]:
+    for full_hotkey, data in emission_map.items():
         if full_hotkey.startswith(short_hotkey):
-            return emission
+            return data
     return None
 
 def cleanup_session():
@@ -679,20 +682,31 @@ st.divider()
 summary_df = build_last_seen_summary(conn, TZ_NAME, miners=selected_miners)
 if not summary_df.empty:
     if emission_map:
-        summary_df["emission"] = summary_df["miner_hotkey"].apply(
+        # Match emission data and extract UID and emission values
+        emission_data = summary_df["miner_hotkey"].apply(
             lambda hk: match_hotkey_emission(hk, emission_map)
         )
-        summary_df["emission"] = summary_df["emission"].fillna(0.0)
-        summary_df["emission"] = summary_df["emission"].round(2)
-    
+
+        # Extract UID (handle None values)
+        summary_df["uid"] = emission_data.apply(
+            lambda x: int(x["uid"]) if x is not None else None
+        )
+
+        # Extract emission and rename to 'Alpha per 1D'
+        summary_df["Alpha per 1D"] = emission_data.apply(
+            lambda x: x["emission"] if x is not None else 0.0
+        )
+        summary_df["Alpha per 1D"] = summary_df["Alpha per 1D"].fillna(0.0)
+        summary_df["Alpha per 1D"] = summary_df["Alpha per 1D"].round(2)
+
     if anti_doxx:
         summary_df = summary_df.copy()
         summary_df["miner_hotkey"] = summary_df["miner_hotkey"].map(mask_hotkey)
-    
+
     if emission_map:
-        column_order = ["miner_hotkey", "last_layer", "last_state", "last_seen", "emission"]
+        column_order = ["miner_hotkey", "uid", "last_layer", "last_state", "last_seen", "Alpha per 1D"]
         summary_df = summary_df[column_order]
-    
+
     st.dataframe(
         summary_df.reset_index(drop=True),
         hide_index=True,
