@@ -19,102 +19,46 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
 def ensure_schema(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS miners (
-        hotkey TEXT PRIMARY KEY
-    )
-    """)
+    tables = [
+        "CREATE TABLE IF NOT EXISTS miners (hotkey TEXT PRIMARY KEY)",
+        """CREATE TABLE IF NOT EXISTS backward_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, since_reset INTEGER NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS loss_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, loss REAL NOT NULL, activation_id TEXT)""",
+        """CREATE TABLE IF NOT EXISTS state_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            to_state TEXT NOT NULL, ts TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS exceptions (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, ex_type TEXT, level TEXT, http_endpoint TEXT,
+            http_code INTEGER, message TEXT, message_normalized TEXT,
+            line_number INTEGER, source_file TEXT)""",
+        """CREATE TABLE IF NOT EXISTS optimization_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, step_number INTEGER, backwards_count INTEGER)""",
+        """CREATE TABLE IF NOT EXISTS resource_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, event_type TEXT NOT NULL, value_gb REAL, value_text TEXT)""",
+        """CREATE TABLE IF NOT EXISTS registration_events (
+            id INTEGER PRIMARY KEY, miner_hotkey TEXT NOT NULL, layer INTEGER,
+            ts TEXT NOT NULL, training_epoch INTEGER, status TEXT)""",
+    ]
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS backward_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        since_reset INTEGER NOT NULL
-    )
-    """)
+    indices = [
+        "CREATE INDEX IF NOT EXISTS idx_bw_miner_ts ON backward_events(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_loss_miner_ts ON loss_events(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_state_miner_ts ON state_events(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_exc_miner_ts ON exceptions(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_exc_normalized ON exceptions(message_normalized)",
+        "CREATE INDEX IF NOT EXISTS idx_opt_miner_ts ON optimization_events(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_res_miner_ts ON resource_events(miner_hotkey, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_reg_miner_ts ON registration_events(miner_hotkey, ts)",
+    ]
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS loss_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        loss REAL NOT NULL,
-        activation_id TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS state_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        to_state TEXT NOT NULL,
-        ts TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS exceptions (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        ex_type TEXT,
-        level TEXT,
-        http_endpoint TEXT,
-        http_code INTEGER,
-        message TEXT,
-        message_normalized TEXT,
-        line_number INTEGER,
-        source_file TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS optimization_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        step_number INTEGER,
-        backwards_count INTEGER
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS resource_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        value_gb REAL,
-        value_text TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS registration_events (
-        id INTEGER PRIMARY KEY,
-        miner_hotkey TEXT NOT NULL,
-        layer INTEGER,
-        ts TEXT NOT NULL,
-        training_epoch INTEGER,
-        status TEXT
-    )
-    """)
-
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_bw_miner_ts ON backward_events(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_loss_miner_ts ON loss_events(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_state_miner_ts ON state_events(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_exc_miner_ts ON exceptions(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_exc_normalized ON exceptions(message_normalized)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_opt_miner_ts ON optimization_events(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_res_miner_ts ON resource_events(miner_hotkey, ts)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_reg_miner_ts ON registration_events(miner_hotkey, ts)")
+    for sql in tables + indices:
+        cur.execute(sql)
 
     conn.commit()
 
@@ -145,7 +89,6 @@ def migrate_normalize_messages(conn: sqlite3.Connection) -> None:
 
         conn.commit()
 
-    # Add line_number and source_file columns if they don't exist
     if "line_number" not in columns:
         cur.execute("ALTER TABLE exceptions ADD COLUMN line_number INTEGER")
         conn.commit()

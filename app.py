@@ -30,6 +30,77 @@ HEADER_RX = re.compile(
     r"^(?P<dt>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\s+\|\s+(?P<level>[A-Z]+)\s+\|[^|]*\|\s+(?P<msg>.*)$"
 )
 
+LOG_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>{filename}</title>
+    <style>
+        body {{
+            margin: 0;
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+        }}
+        .header {{
+            position: sticky;
+            top: 0;
+            background-color: #2d2d2d;
+            padding: 10px;
+            border-bottom: 2px solid #444;
+            margin-bottom: 20px;
+        }}
+        .log-line {{
+            white-space: pre;
+            line-height: 1.4;
+            padding: 2px 0;
+        }}
+        .log-line-number {{
+            display: inline-block;
+            width: 60px;
+            color: #858585;
+            text-align: right;
+            margin-right: 15px;
+            user-select: none;
+        }}
+        .exception-line {{
+            background-color: #5a1e1e;
+            border-left: 4px solid #f48771;
+            padding: 2px;
+            margin-left: -4px;
+        }}
+        .exception-line .log-content {{
+            background-color: #f48771;
+            color: #1e1e1e;
+            padding: 2px 4px;
+            font-weight: bold;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>{filename}</h2>
+        <p>File size: {filesize_mb} MB | Lines: {total_lines}</p>{target_line_info}
+    </div>
+    <div class="log-container">
+{log_lines}
+    </div>
+{scroll_script}
+</body>
+</html>'''
+
+SCROLL_SCRIPT = '''
+    <script>
+    window.addEventListener('load', function() {
+        var target = document.getElementById('target-line');
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    });
+    </script>'''
+
 def _ts_key(dt) -> tuple[int, int, int, int, int, int, int]:
     return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond)
 
@@ -77,19 +148,16 @@ def _find_exception_line_and_context(
     pre_lines: int = 100,
     post_lines: int = 25,
 ) -> Tuple[Optional[str], List[str], List[str], Optional[int]]:
-    """Find exception line and return (filename, before_lines, after_lines, line_number)"""
     idx_pack = st.session_state.get("report_index", [])
     key = _ts_key(ts_local.to_pydatetime())
 
-    # Use multiple parts of message for better matching
     msg_parts = []
     if message:
         msg_clean = message.strip()
-        # Try to extract distinctive parts
         if len(msg_clean) > 20:
-            msg_parts.append(msg_clean[:40])  # First 40 chars
+            msg_parts.append(msg_clean[:40])
         if len(msg_clean) > 80:
-            msg_parts.append(msg_clean[40:80])  # Middle part
+            msg_parts.append(msg_clean[40:80])
         if len(msg_clean) <= 20:
             msg_parts.append(msg_clean)
 
@@ -98,7 +166,6 @@ def _find_exception_line_and_context(
         if not keys:
             continue
         pos = bisect_left(keys, key)
-        # Search in a wider window around the timestamp
         start = max(0, pos - 5)
         stop = min(len(keys), pos + 6)
 
@@ -106,7 +173,6 @@ def _find_exception_line_and_context(
         best_score = 0
 
         for j in range(start, stop):
-            # Must match timestamp and level
             if keys[j] != key or idxf["levels"][j] != level:
                 continue
 
@@ -117,19 +183,16 @@ def _find_exception_line_and_context(
             li = idxf["line_idx"][j]
             line = lines[li]
 
-            # Score the match quality
             score = 0
             if msg_parts:
                 for part in msg_parts:
                     if part and part in line:
                         score += len(part)
 
-            # If we have any message match, prefer it
             if score > best_score:
                 best_score = score
                 best_match = li
             elif score == 0 and best_match is None:
-                # No message match yet, use first timestamp+level match
                 best_match = li
 
         if best_match is not None:
@@ -244,7 +307,6 @@ def _find_file_containing_exception(
     message: str,
     file_paths: List[Path]
 ) -> Optional[Path]:
-    """Find which file contains the exception by timestamp (DEPRECATED - use _match_source_file_to_path instead)"""
     if "file_metadata" not in st.session_state:
         return file_paths[0] if file_paths else None
 
@@ -262,24 +324,13 @@ def _match_source_file_to_path(
     source_file: str,
     file_paths: List[Path]
 ) -> Optional[Path]:
-    """Match a source file name from the database to a full Path object.
-
-    Args:
-        source_file: The filename stored in the database (e.g., "miner.log")
-        file_paths: List of available file paths from session state
-
-    Returns:
-        The matching Path object, or None if not found
-    """
     if not source_file or not file_paths:
         return None
 
-    # Direct name match (most common case)
     for path in file_paths:
         if path.name == source_file:
             return path
 
-    # Fallback: check if source_file is a substring of any filename
     for path in file_paths:
         if source_file in str(path):
             return path
@@ -295,147 +346,58 @@ def _generate_log_html(
     mask_map: Dict[str, str],
     target_line_number: Optional[int] = None
 ) -> str:
-    """Generate HTML file with highlighted exception"""
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
     except Exception:
         return "<html><body><h1>Error loading file</h1></body></html>"
 
-    # Find target line - use provided line number or search
     target_line_idx = None
     if target_line_number is not None:
-        # Line numbers are 1-indexed, convert to 0-indexed
         target_line_idx = target_line_number - 1
-        # Validate line number is within bounds
         if target_line_idx < 0 or target_line_idx >= len(lines):
             target_line_idx = None
 
-    # Only use timestamp fallback if no line number was provided at all
     if target_line_number is None:
-        # Fallback: search by timestamp and miner (for backward compatibility)
         target_ts_str = target_timestamp.strftime("%Y-%m-%d %H:%M:%S")
-
         for idx, line in enumerate(lines):
             m = HEADER_RX.match(line)
-            if m:
-                line_dt = m.group("dt")
-                if target_ts_str in line_dt and miner_hotkey in line:
-                    target_line_idx = idx
-                    break
-    
-    # Build HTML
-    html_lines = ['''<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>''' + file_path.name + '''</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 20px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-        }
-        .header {
-            position: sticky;
-            top: 0;
-            background-color: #2d2d2d;
-            padding: 10px;
-            border-bottom: 2px solid #444;
-            margin-bottom: 20px;
-        }
-        .log-line {
-            white-space: pre;
-            line-height: 1.4;
-            padding: 2px 0;
-        }
-        .log-line-number {
-            display: inline-block;
-            width: 60px;
-            color: #858585;
-            text-align: right;
-            margin-right: 15px;
-            user-select: none;
-        }
-        .exception-line {
-            background-color: #5a1e1e;
-            border-left: 4px solid #f48771;
-            padding: 2px;
-            margin-left: -4px;
-        }
-        .exception-line .log-content {
-            background-color: #f48771;
-            color: #1e1e1e;
-            padding: 2px 4px;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h2>''' + file_path.name + '''</h2>
-        <p>File size: ''' + f"{file_path.stat().st_size / (1024*1024):.2f}" + ''' MB | Lines: ''' + str(len(lines)) + '''</p>''']
-    
-    if target_line_idx is not None:
-        html_lines.append(f'        <p>🎯 Exception highlighted at line {target_line_idx + 1}</p>')
-    
-    html_lines.append('    </div>')
-    html_lines.append('    <div class="log-container">')
-    
-    # Add all lines
+            if m and target_ts_str in m.group("dt") and miner_hotkey in line:
+                target_line_idx = idx
+                break
+
+    log_lines = []
     for idx, line in enumerate(lines):
-        line_content = line.rstrip('\n')
-        # Escape HTML
-        line_content = line_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        
-        # Apply anti-doxx masking if needed
+        line_content = html.escape(line.rstrip('\n'))
         if anti_doxx:
             for real, masked in mask_map.items():
                 line_content = line_content.replace(real, masked)
-        
+
         line_number = idx + 1
-        is_exception_line = (idx == target_line_idx)
-        
-        if is_exception_line:
-            html_lines.append(
+        is_exception = (idx == target_line_idx)
+
+        if is_exception:
+            log_lines.append(
                 f'<div class="log-line exception-line" id="target-line">'
                 f'<span class="log-line-number">{line_number}</span>'
-                f'<span class="log-content">{line_content}</span>'
-                f'</div>'
+                f'<span class="log-content">{line_content}</span></div>'
             )
         else:
-            html_lines.append(
-                f'<div class="log-line">'
-                f'<span class="log-line-number">{line_number}</span>'
-                f'{line_content}'
-                f'</div>'
+            log_lines.append(
+                f'<div class="log-line"><span class="log-line-number">{line_number}</span>{line_content}</div>'
             )
-    
-    html_lines.append('    </div>')
-    
-    # Add JavaScript to scroll to target line
-    if target_line_idx is not None:
-        html_lines.append('''
-    <script>
-    window.addEventListener('load', function() {
-        var target = document.getElementById('target-line');
-        if (target) {
-            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-    });
-    </script>''')
-    
-    html_lines.append('</body>')
-    html_lines.append('</html>')
-    
-    return '\n'.join(html_lines)
+
+    return LOG_HTML_TEMPLATE.format(
+        filename=file_path.name,
+        filesize_mb=f"{file_path.stat().st_size / (1024*1024):.2f}",
+        total_lines=len(lines),
+        target_line_info=f'        <p>🎯 Exception highlighted at line {target_line_idx + 1}</p>' if target_line_idx is not None else '',
+        log_lines='\n'.join(log_lines),
+        scroll_script=SCROLL_SCRIPT if target_line_idx is not None else ''
+    )
 
 
 def _clear_all_tables(conn):
-    """Clear all data from database tables"""
     tables = ["miners", "backward_events", "loss_events", "state_events",
               "exceptions", "optimization_events", "resource_events", "registration_events"]
     for table in tables:
@@ -443,21 +405,23 @@ def _clear_all_tables(conn):
     conn.commit()
 
 def _load_and_process_files(conn, uploaded_files, file_paths, progress_callback=None):
-    """Load files into DB and build indices"""
     import streamlit as st
     from minerlogs.ingest import ingest_uploaded_files
+    from concurrent.futures import ThreadPoolExecutor
 
     st.session_state["uploaded_file_paths"] = file_paths
     if "report_index" in st.session_state:
         del st.session_state["report_index"]
 
-    with st.spinner("Building file metadata..."):
-        st.session_state["file_metadata"] = _build_file_metadata(file_paths)
+    with st.spinner("Building metadata and indices in parallel..."):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_metadata = executor.submit(_build_file_metadata, file_paths)
+            future_index = executor.submit(_build_header_indices, file_paths)
 
-    with st.spinner("Indexing log files for fast context extraction..."):
-        st.session_state["report_index"] = _build_header_indices(file_paths)
+            st.session_state["file_metadata"] = future_metadata.result()
+            st.session_state["report_index"] = future_index.result()
 
-    with st.spinner("Parsing logs..."):
+    with st.spinner("Parsing logs and writing to database..."):
         total_files, total_lines, counters = ingest_uploaded_files(
             conn=conn,
             uploaded_files=uploaded_files,
@@ -511,10 +475,6 @@ def init_session():
 
         atexit.register(cleanup_session)
 
-
-# ============================================================================
-# UI RENDERING FUNCTIONS
-# ============================================================================
 
 def render_sidebar(conn):
     import streamlit as st
@@ -1433,12 +1393,10 @@ if __name__ == "__main__":
 
     st.divider()
 
-    # Summary table
     render_summary_table(conn, selected_miners, emission_map, anti_doxx, mask_hotkey)
 
     st.divider()
 
-    # Query data
     bw_df = query_backward_events(conn, TZ_NAME, miners=selected_miners)
     loss_df = query_losses(conn, TZ_NAME, miners=selected_miners)
     res_df = query_resource_events(conn, TZ_NAME, miners=selected_miners)
@@ -1451,10 +1409,8 @@ if __name__ == "__main__":
     exc_df_raw = query_exceptions(conn, TZ_NAME, miners=selected_miners, time_range=time_range)
     exc_df = _apply_exception_filters(exc_df_raw, st.session_state["exception_filters"])
 
-    # Store exc_df for time range widget
     st.session_state["current_exc_df"] = exc_df
 
-    # Create mask_text_hotkeys function
     _hotkey_kv_rx = re.compile(r"('hotkey'\s*:\s*')([A-Za-z0-9]{8})(')")
 
     def mask_text_hotkeys(text: str) -> str:
@@ -1473,19 +1429,13 @@ if __name__ == "__main__":
                 out = out.replace(real, masked)
         return out
 
-    # Backward passes chart
     render_backward_chart(bw_df, loss_df, exc_df, time_selection, anti_doxx, mask_map_full)
 
-    # Time range widget
     render_time_range_widget(time_selection, st.session_state.get("file_metadata", {}))
 
-    # GPU section
     render_gpu_section(res_df, anti_doxx, mask_hotkey)
 
-    # Exception filters
     render_exception_filters(exc_df_raw)
-
-    # Exceptions section
     grouped = (
         exc_df.groupby("message_normalized", dropna=False)
         .agg({

@@ -10,33 +10,21 @@ from multiprocessing import Pool, cpu_count
 
 from .timeutil import parse_log_datetime
 
-def _cache_miner(miner: Optional[str], miners_cache: set, miners_batch: list) -> None:
-    """Add miner to cache and batch if not already present"""
-    if miner and miner not in miners_cache:
-        miners_batch.append((miner,))
-        miners_cache.add(miner)
+def _int_or_none(x) -> Optional[int]:
+    try:
+        return int(x) if x is not None else None
+    except (TypeError, ValueError):
+        return None
 
-def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, Dict[str, int], Dict[str, List]]:
-    """Parse a single file and return batch data without writing to DB"""
-    name, text, tz_name, idx = args
-
+def _process_log_lines(text: str, tz_name: str, rx: "_RegexBundle", source_file: str = ""):
     tz_local = ZoneInfo(tz_name)
-    rx = _RegexBundle()
     miners_cache: set[str] = set()
     last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
+
     counters = {
         "backward": 0, "loss": 0, "states": 0,
         "exceptions": 0, "optimization": 0, "resource": 0, "registration": 0
     }
-
-    miners_batch = []
-    backward_batch = []
-    loss_batch = []
-    state_batch = []
-    optimization_batch = []
-    resource_batch = []
-    registration_batch = []
-    exception_batch = []
 
     n_lines = 0
     fh = io.StringIO(text)
@@ -57,14 +45,18 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
 
             miner = _extract_hotkey(rx, line, msg)
             layer = _extract_layer(rx, line, msg)
-            _cache_miner(miner, miners_cache, miners_batch)
+            if miner and miner not in miners_cache:
+                yield ("miner", (miner,))
+                miners_cache.add(miner)
             last_ctx = {"ts_utc_iso": ts_utc_iso, "miner": miner, "layer": _int_or_none(layer)}
 
             mb = rx.backward_since_reset.search(msg)
             if mb:
                 miner_eff = miner or mb.group("miner")
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                backward_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, int(mb.group("count"))))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("backward", (miner_eff or "", _int_or_none(layer), ts_utc_iso, int(mb.group("count"))))
                 counters["backward"] += 1
                 continue
 
@@ -73,8 +65,10 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
                 miner_loss = (ml.group("miner") if ml.lastindex >= 4 else None) or miner
                 layer_loss = (_int_or_none(ml.group("layer")) if ml.lastindex >= 3 else None) or _int_or_none(layer)
                 activation_id = ml.group("activation") if ml.lastindex >= 2 else None
-                _cache_miner(miner_loss, miners_cache, miners_batch)
-                loss_batch.append((miner_loss or "", layer_loss, ts_utc_iso, float(ml.group("loss")), activation_id))
+                if miner_loss and miner_loss not in miners_cache:
+                    yield ("miner", (miner_loss,))
+                    miners_cache.add(miner_loss)
+                yield ("loss", (miner_loss or "", layer_loss, ts_utc_iso, float(ml.group("loss")), activation_id))
                 counters["loss"] += 1
                 continue
 
@@ -82,55 +76,69 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
             if ms:
                 miner_eff = miner or ms.group("miner")
                 layer_eff = _int_or_none(layer if layer is not None else int(ms.group("layer")))
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                state_batch.append((miner_eff or "", layer_eff, ms.group("state"), ts_utc_iso))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("state", (miner_eff or "", layer_eff, ms.group("state"), ts_utc_iso))
                 counters["states"] += 1
                 continue
 
             mopt = rx.optimization_step.search(msg)
             if mopt:
                 miner_eff = miner or mopt.group("miner")
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                optimization_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, None, int(mopt.group("backwards"))))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("optimization", (miner_eff or "", _int_or_none(layer), ts_utc_iso, None, int(mopt.group("backwards"))))
                 counters["optimization"] += 1
                 continue
 
             mopt_complete = rx.optimization_complete.search(msg)
             if mopt_complete:
                 miner_eff = miner or mopt_complete.group("miner")
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                optimization_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, int(mopt_complete.group("step")), None))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("optimization", (miner_eff or "", _int_or_none(layer), ts_utc_iso, int(mopt_complete.group("step")), None))
                 counters["optimization"] += 1
                 continue
 
             mgpu = rx.gpu_memory.search(msg)
             if mgpu:
-                _cache_miner(miner, miners_cache, miners_batch)
-                resource_batch.append((miner or "", _int_or_none(layer), ts_utc_iso, "gpu_memory", float(mgpu.group("memory")), None))
+                if miner and miner not in miners_cache:
+                    yield ("miner", (miner,))
+                    miners_cache.add(miner)
+                yield ("resource", (miner or "", _int_or_none(layer), ts_utc_iso, "gpu_memory", float(mgpu.group("memory")), None))
                 counters["resource"] += 1
                 continue
 
             mgpu_usage = rx.gpu_memory_usage.search(msg)
             if mgpu_usage:
                 used, total = float(mgpu_usage.group("used")), float(mgpu_usage.group("total"))
-                _cache_miner(miner, miners_cache, miners_batch)
-                resource_batch.append((miner or "", _int_or_none(layer), ts_utc_iso, "gpu_memory_usage", used, f"{used}/{total}"))
+                if miner and miner not in miners_cache:
+                    yield ("miner", (miner,))
+                    miners_cache.add(miner)
+                yield ("resource", (miner or "", _int_or_none(layer), ts_utc_iso, "gpu_memory_usage", used, f"{used}/{total}"))
                 counters["resource"] += 1
                 continue
 
             mcache = rx.cache_full.search(msg)
             if mcache:
                 miner_eff = miner or mcache.group("miner")
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                resource_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, "cache_full", None, str(int(mcache.group("count")))))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("resource", (miner_eff or "", _int_or_none(layer), ts_utc_iso, "cache_full", None, str(int(mcache.group("count")))))
                 counters["resource"] += 1
                 continue
 
             mreg = rx.registration_success.search(msg)
             if mreg:
                 miner_eff = miner or mreg.group("miner")
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                registration_batch.append((miner_eff or "", int(mreg.group("layer")), ts_utc_iso, int(mreg.group("epoch")), "registered"))
+                if miner_eff and miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("registration", (miner_eff or "", int(mreg.group("layer")), ts_utc_iso, int(mreg.group("epoch")), "registered"))
                 counters["registration"] += 1
                 continue
 
@@ -142,7 +150,7 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
                     continue
 
                 normalized_msg = _normalize_exception_message(cleaned_msg)
-                exception_batch.append((miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg, n_lines, name))
+                yield ("exception", (miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg, n_lines, source_file))
                 counters["exceptions"] += 1
                 continue
 
@@ -155,21 +163,37 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
             miner_eff = (miner_tail.group("hotkey") if miner_tail else None) or last_ctx["miner"]
             layer_eff = _int_or_none(int(layer_tail.group("layer")) if layer_tail else last_ctx["layer"])
             if last_ctx["ts_utc_iso"] and miner_eff:
-                _cache_miner(miner_eff, miners_cache, miners_batch)
-                backward_batch.append((miner_eff, layer_eff, last_ctx["ts_utc_iso"], int(mstep.group("count"))))
+                if miner_eff not in miners_cache:
+                    yield ("miner", (miner_eff,))
+                    miners_cache.add(miner_eff)
+                yield ("backward", (miner_eff, layer_eff, last_ctx["ts_utc_iso"], int(mstep.group("count"))))
                 counters["backward"] += 1
             continue
 
+    yield ("counters", counters)
+    yield ("lines", n_lines)
+
+def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, Dict[str, int], Dict[str, List]]:
+    name, text, tz_name, idx = args
+    rx = _RegexBundle()
+
     batches = {
-        "miners": miners_batch,
-        "backward": backward_batch,
-        "loss": loss_batch,
-        "state": state_batch,
-        "optimization": optimization_batch,
-        "resource": resource_batch,
-        "registration": registration_batch,
-        "exception": exception_batch,
+        "miners": [], "backward": [], "loss": [], "state": [],
+        "optimization": [], "resource": [], "registration": [], "exception": []
     }
+
+    counters = {}
+    n_lines = 0
+
+    for event_type, event_data in _process_log_lines(text, tz_name, rx, name):
+        if event_type == "counters":
+            counters = event_data
+        elif event_type == "lines":
+            n_lines = event_data
+        elif event_type == "miner":
+            batches["miners"].append(event_data)
+        else:
+            batches[event_type].append(event_data)
 
     return name, n_lines, counters, batches
 
@@ -194,12 +218,14 @@ def ingest_uploaded_files(
             text = uf.getvalue().decode("utf-8", errors="replace")
             file_data.append((name, text))
         except Exception:
-            _log(progress_callback, f"[{idx}/{len(uploaded_files)}] Skipping unreadable file: {name}")
+            if progress_callback:
+                progress_callback(f"[{idx}/{len(uploaded_files)}] Skipping unreadable file: {name}")
             continue
 
     if len(file_data) <= 4:
         for idx, (name, text) in enumerate(file_data, start=1):
-            _log(progress_callback, f"[{idx}/{len(file_data)}] Parsing uploaded file: {name} (size ~{len(text):,} chars)")
+            if progress_callback:
+                progress_callback(f"[{idx}/{len(file_data)}] Parsing uploaded file: {name} (size ~{len(text):,} chars)")
             n_lines, _, counters = _ingest_stream(
                 conn=conn,
                 text=text,
@@ -213,14 +239,16 @@ def ingest_uploaded_files(
             for k in counters_sum:
                 counters_sum[k] += counters[k]
     else:
-        _log(progress_callback, f"Processing {len(file_data)} files in parallel...")
+        if progress_callback:
+            progress_callback(f"Processing {len(file_data)} files in parallel...")
 
         args = [(name, text, tz_name, idx) for idx, (name, text) in enumerate(file_data, start=1)]
 
         with Pool(min(cpu_count(), len(file_data))) as pool:
             results = pool.map(_parse_file_to_batches, args)
 
-        _log(progress_callback, f"Writing results to database...")
+        if progress_callback:
+            progress_callback(f"Writing results to database...")
         cur = conn.cursor()
 
         for name, n_lines, counters, batches in results:
@@ -248,36 +276,36 @@ def ingest_uploaded_files(
 
         conn.commit()
 
-    _log(progress_callback, f"Done. Parsed {total_files} uploaded file(s), processed ~{total_lines:,} line(s).")
+    if progress_callback:
+        progress_callback(f"Done. Parsed {total_files} uploaded file(s), processed ~{total_lines:,} line(s).")
     return total_files, total_lines, counters_sum
 
 
+BATCH_SQL = {
+    "miners": "INSERT OR IGNORE INTO miners (hotkey) VALUES (?)",
+    "backward": "INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)",
+    "loss": "INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)",
+    "state": "INSERT INTO state_events (miner_hotkey, layer, to_state, ts) VALUES (?, ?, ?, ?)",
+    "optimization": "INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)",
+    "resource": "INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)",
+    "registration": "INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)",
+    "exception": "INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+}
+
+def _flush_single_batch(cur, batch_key: str, batch: list):
+    if batch:
+        cur.executemany(BATCH_SQL[batch_key], batch)
+
 def _flush_batches(cur, miners_batch, backward_batch, loss_batch, state_batch,
                    optimization_batch, resource_batch, registration_batch, exception_batch):
-    if miners_batch:
-        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-        miners_batch.clear()
-    if backward_batch:
-        cur.executemany("INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)", backward_batch)
-        backward_batch.clear()
-    if loss_batch:
-        cur.executemany("INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)", loss_batch)
-        loss_batch.clear()
-    if state_batch:
-        cur.executemany("INSERT INTO state_events (miner_hotkey, layer, to_state, ts) VALUES (?, ?, ?, ?)", state_batch)
-        state_batch.clear()
-    if optimization_batch:
-        cur.executemany("INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)", optimization_batch)
-        optimization_batch.clear()
-    if resource_batch:
-        cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", resource_batch)
-        resource_batch.clear()
-    if registration_batch:
-        cur.executemany("INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)", registration_batch)
-        registration_batch.clear()
-    if exception_batch:
-        cur.executemany("INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", exception_batch)
-        exception_batch.clear()
+    _flush_single_batch(cur, "miners", miners_batch)
+    _flush_single_batch(cur, "backward", backward_batch)
+    _flush_single_batch(cur, "loss", loss_batch)
+    _flush_single_batch(cur, "state", state_batch)
+    _flush_single_batch(cur, "optimization", optimization_batch)
+    _flush_single_batch(cur, "resource", resource_batch)
+    _flush_single_batch(cur, "registration", registration_batch)
+    _flush_single_batch(cur, "exception", exception_batch)
 
 def _ingest_stream(
     conn: sqlite3.Connection,
@@ -287,270 +315,33 @@ def _ingest_stream(
     progress_callback: Optional[Callable[[str], None]],
     source_file: str = "",
 ) -> Tuple[int, int, dict]:
-    tz_local = ZoneInfo(tz_name)
-    miners_cache: set[str] = set()
-    last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
-    counters = {
-        "backward": 0, "loss": 0, "states": 0,
-        "exceptions": 0, "optimization": 0, "resource": 0, "registration": 0
+    BATCH_SIZE = 1000
+    batches = {
+        "miners": [], "backward": [], "loss": [], "state": [],
+        "optimization": [], "resource": [], "registration": [], "exception": []
     }
 
-    BATCH_SIZE = 1000
-    backward_batch = []
-    loss_batch = []
-    state_batch = []
-    optimization_batch = []
-    resource_batch = []
-    registration_batch = []
-    exception_batch = []
-    miners_batch = []
-
+    counters = {}
     n_lines = 0
     cur = conn.cursor()
-    fh = io.StringIO(text)
 
-    for line in fh:
-        n_lines += 1
-        m = rx.header.match(line)
-        if m:
-            dt_str = m.group("dt")
-            level = m.group("level")
-            msg = m.group("msg")
-            ts_local = parse_log_datetime(dt_str)
-            if ts_local is None:
-                last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
-                continue
-            ts_local = ts_local.replace(tzinfo=tz_local)
-            ts_utc_iso = ts_local.astimezone(timezone.utc).isoformat()
-
-            miner = _extract_hotkey(rx, line, msg)
-            layer = _extract_layer(rx, line, msg)
-            if miner and miner not in miners_cache:
-                miners_batch.append((miner,))
-                miners_cache.add(miner)
-                if len(miners_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                    miners_batch.clear()
-            last_ctx = {"ts_utc_iso": ts_utc_iso, "miner": miner, "layer": _int_or_none(layer)}
-
-            mb = rx.backward_since_reset.search(msg)
-            if mb:
-                miner_b = mb.group("miner")
-                since_reset = int(mb.group("count"))
-                miner_eff = miner or miner_b
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                backward_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, since_reset))
-                if len(backward_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)", backward_batch)
-                    backward_batch.clear()
-                counters["backward"] += 1
-                continue
-
-            ml = rx.loss.search(msg)
-            if ml:
-                loss = float(ml.group("loss"))
-                activation_id = ml.group("activation") if ml.lastindex >= 2 else None
-                layer_loss = _int_or_none(ml.group("layer")) if ml.lastindex >= 3 else None
-                miner_loss = ml.group("miner") if ml.lastindex >= 4 else None
-
-                if not miner_loss:
-                    miner_loss = miner
-                if not layer_loss:
-                    layer_loss = _int_or_none(layer)
-
-                if miner_loss and miner_loss not in miners_cache:
-                    miners_batch.append((miner_loss,))
-                    miners_cache.add(miner_loss)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-
-                loss_batch.append((miner_loss or "", layer_loss, ts_utc_iso, loss, activation_id))
-                if len(loss_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)", loss_batch)
-                    loss_batch.clear()
-                counters["loss"] += 1
-                continue
-
-            ms = rx.state_line.search(msg)
-            if ms:
-                miner_s = ms.group("miner")
-                layer_s = int(ms.group("layer"))
-                to_state = ms.group("state")
-                miner_eff = miner or miner_s
-                layer_eff = _int_or_none(layer if layer is not None else layer_s)
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                state_batch.append((miner_eff or "", layer_eff, to_state, ts_utc_iso))
-                if len(state_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO state_events (miner_hotkey, layer, to_state, ts) VALUES (?, ?, ?, ?)", state_batch)
-                    state_batch.clear()
-                counters["states"] += 1
-                continue
-
-            mopt = rx.optimization_step.search(msg)
-            if mopt:
-                miner_opt = mopt.group("miner")
-                backwards = int(mopt.group("backwards"))
-                step_num = None
-                miner_eff = miner or miner_opt
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                optimization_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, step_num, backwards))
-                if len(optimization_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)", optimization_batch)
-                    optimization_batch.clear()
-                counters["optimization"] += 1
-                continue
-
-            mopt_complete = rx.optimization_complete.search(msg)
-            if mopt_complete:
-                miner_opt = mopt_complete.group("miner")
-                step_num = int(mopt_complete.group("step"))
-                miner_eff = miner or miner_opt
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                optimization_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, step_num, None))
-                if len(optimization_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)", optimization_batch)
-                    optimization_batch.clear()
-                counters["optimization"] += 1
-                continue
-
-            mgpu = rx.gpu_memory.search(msg)
-            if mgpu:
-                memory_gb = float(mgpu.group("memory"))
-                event_type = "gpu_memory"
-                miner_eff = miner
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                resource_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, memory_gb, None))
-                if len(resource_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", resource_batch)
-                    resource_batch.clear()
-                counters["resource"] += 1
-                continue
-
-            mgpu_usage = rx.gpu_memory_usage.search(msg)
-            if mgpu_usage:
-                used_gb = float(mgpu_usage.group("used"))
-                total_gb = float(mgpu_usage.group("total"))
-                event_type = "gpu_memory_usage"
-                miner_eff = miner
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                resource_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, used_gb, f"{used_gb}/{total_gb}"))
-                if len(resource_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", resource_batch)
-                    resource_batch.clear()
-                counters["resource"] += 1
-                continue
-
-            mcache = rx.cache_full.search(msg)
-            if mcache:
-                miner_cache = mcache.group("miner")
-                count = int(mcache.group("count"))
-                event_type = "cache_full"
-                miner_eff = miner or miner_cache
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                resource_batch.append((miner_eff or "", _int_or_none(layer), ts_utc_iso, event_type, None, str(count)))
-                if len(resource_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", resource_batch)
-                    resource_batch.clear()
-                counters["resource"] += 1
-                continue
-
-            mreg = rx.registration_success.search(msg)
-            if mreg:
-                miner_reg = mreg.group("miner")
-                layer_reg = int(mreg.group("layer"))
-                epoch = int(mreg.group("epoch"))
-                miner_eff = miner or miner_reg
-                if miner_eff and miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                registration_batch.append((miner_eff or "", layer_reg, ts_utc_iso, epoch, "registered"))
-                if len(registration_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)", registration_batch)
-                    registration_batch.clear()
-                counters["registration"] += 1
-                continue
-
-            if level in ("ERROR", "CRITICAL"):
-                ex_type, http_endpoint, http_code = _extract_exception_bits(rx, msg)
-                cleaned_msg = _clean_message(msg)
-
-                if not cleaned_msg or not cleaned_msg.strip() or cleaned_msg.strip() in ('|', '||', '|||'):
-                    continue
-
-                normalized_msg = _normalize_exception_message(cleaned_msg)
-
-                exception_batch.append((miner or "", _int_or_none(layer), ts_utc_iso, ex_type, level, http_endpoint, http_code, cleaned_msg, normalized_msg, n_lines, source_file))
-                if len(exception_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", exception_batch)
-                    exception_batch.clear()
-                counters["exceptions"] += 1
-                continue
-
+    for event_type, event_data in _process_log_lines(text, tz_name, rx, source_file):
+        if event_type == "counters":
+            counters = event_data
+            continue
+        elif event_type == "lines":
+            n_lines = event_data
             continue
 
-        mstep = rx.backward_in_step.search(line)
-        if mstep:
-            since_reset = int(mstep.group("count"))
-            miner_tail = rx.tail_hotkey.search(line)
-            layer_tail = rx.tail_layer.search(line)
-            miner_eff = (miner_tail.group("hotkey") if miner_tail else None) or last_ctx["miner"]
-            layer_eff = _int_or_none(int(layer_tail.group("layer")) if layer_tail else last_ctx["layer"])
-            ts_eff = last_ctx["ts_utc_iso"]
-            if ts_eff and miner_eff:
-                if miner_eff not in miners_cache:
-                    miners_batch.append((miner_eff,))
-                    miners_cache.add(miner_eff)
-                    if len(miners_batch) >= BATCH_SIZE:
-                        cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", miners_batch)
-                        miners_batch.clear()
-                backward_batch.append((miner_eff, layer_eff, ts_eff, since_reset))
-                if len(backward_batch) >= BATCH_SIZE:
-                    cur.executemany("INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)", backward_batch)
-                    backward_batch.clear()
-                counters["backward"] += 1
-            continue
+        batch_key = "miners" if event_type == "miner" else event_type
+        batches[batch_key].append(event_data)
 
-    _flush_batches(cur, miners_batch, backward_batch, loss_batch, state_batch,
-                   optimization_batch, resource_batch, registration_batch, exception_batch)
+        if len(batches[batch_key]) >= BATCH_SIZE:
+            _flush_single_batch(cur, batch_key, batches[batch_key])
+            batches[batch_key].clear()
+
+    _flush_batches(cur, batches["miners"], batches["backward"], batches["loss"], batches["state"],
+                   batches["optimization"], batches["resource"], batches["registration"], batches["exception"])
     conn.commit()
     return n_lines, 0, counters
 
@@ -759,13 +550,3 @@ class _RegexBundle:
         self.http_code = re.compile(r"(?P<code>\d{3})(?=\s*-\s)")
 
 
-def _log(cb: Optional[Callable[[str], None]], msg: str) -> None:
-    if cb:
-        cb(msg)
-
-
-def _int_or_none(x) -> Optional[int]:
-    try:
-        return int(x) if x is not None else None
-    except (TypeError, ValueError):
-        return None
