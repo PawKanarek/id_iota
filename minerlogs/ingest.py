@@ -5,7 +5,6 @@ import sqlite3
 from typing import Callable, List, Optional, Tuple, Dict
 from datetime import timezone
 from zoneinfo import ZoneInfo
-import io
 from multiprocessing import Pool, cpu_count
 
 from .timeutil import parse_log_datetime
@@ -16,7 +15,7 @@ def _int_or_none(x) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-def _process_log_lines(text: str, tz_name: str, rx: "_RegexBundle", source_file: str = ""):
+def _process_log_lines(file_path: str, tz_name: str, rx: "_RegexBundle", source_file: str = ""):
     tz_local = ZoneInfo(tz_name)
     miners_cache: set[str] = set()
     last_ctx = {"ts_utc_iso": None, "miner": None, "layer": None}
@@ -27,7 +26,10 @@ def _process_log_lines(text: str, tz_name: str, rx: "_RegexBundle", source_file:
     }
 
     n_lines = 0
-    fh = io.StringIO(text)
+    min_ts = None
+    max_ts = None
+
+    fh = open(file_path, 'r', encoding='utf-8', errors='replace')
 
     for line in fh:
         n_lines += 1
@@ -42,6 +44,11 @@ def _process_log_lines(text: str, tz_name: str, rx: "_RegexBundle", source_file:
                 continue
             ts_local = ts_local.replace(tzinfo=tz_local)
             ts_utc_iso = ts_local.astimezone(timezone.utc).isoformat()
+
+            if min_ts is None or ts_local < min_ts:
+                min_ts = ts_local
+            if max_ts is None or ts_local > max_ts:
+                max_ts = ts_local
 
             miner = _extract_hotkey(rx, line, msg)
             layer = _extract_layer(rx, line, msg)
@@ -170,11 +177,14 @@ def _process_log_lines(text: str, tz_name: str, rx: "_RegexBundle", source_file:
                 counters["backward"] += 1
             continue
 
+    fh.close()
     yield ("counters", counters)
     yield ("lines", n_lines)
+    yield ("min_ts", min_ts)
+    yield ("max_ts", max_ts)
 
-def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, Dict[str, int], Dict[str, List]]:
-    name, text, tz_name, idx = args
+def _parse_file_to_batches(args: Tuple[str, str, str]) -> Tuple[str, int, Dict[str, int], Dict[str, List], object, object, int]:
+    file_path, name, tz_name = args
     rx = _RegexBundle()
 
     batches = {
@@ -184,25 +194,36 @@ def _parse_file_to_batches(args: Tuple[str, str, str, int]) -> Tuple[str, int, D
 
     counters = {}
     n_lines = 0
+    min_ts = None
+    max_ts = None
 
-    for event_type, event_data in _process_log_lines(text, tz_name, rx, name):
+    for event_type, event_data in _process_log_lines(file_path, tz_name, rx, name):
         if event_type == "counters":
             counters = event_data
         elif event_type == "lines":
             n_lines = event_data
+        elif event_type == "min_ts":
+            min_ts = event_data
+        elif event_type == "max_ts":
+            max_ts = event_data
         elif event_type == "miner":
             batches["miners"].append(event_data)
         else:
             batches[event_type].append(event_data)
 
-    return name, n_lines, counters, batches
+    from pathlib import Path
+    size_bytes = Path(file_path).stat().st_size if Path(file_path).exists() else 0
 
-def ingest_uploaded_files(
+    return name, n_lines, counters, batches, min_ts, max_ts, size_bytes
+
+def ingest_log_files(
     conn: sqlite3.Connection,
-    uploaded_files,
+    file_paths: List,
     tz_name: str,
     progress_callback: Optional[Callable[[str], None]] = None,
 ):
+    from pathlib import Path
+
     rx = _RegexBundle()
     total_files = 0
     total_lines = 0
@@ -211,24 +232,16 @@ def ingest_uploaded_files(
         "exceptions": 0, "optimization": 0, "resource": 0, "registration": 0
     }
 
-    file_data = []
-    for idx, uf in enumerate(uploaded_files, start=1):
-        name = getattr(uf, "name", f"uploaded_{idx}")
-        try:
-            text = uf.getvalue().decode("utf-8", errors="replace")
-            file_data.append((name, text))
-        except Exception:
-            if progress_callback:
-                progress_callback(f"[{idx}/{len(uploaded_files)}] Skipping unreadable file: {name}")
-            continue
+    file_metadata = {}
 
-    if len(file_data) <= 4:
-        for idx, (name, text) in enumerate(file_data, start=1):
+    if len(file_paths) <= 4:
+        for idx, fpath in enumerate(file_paths, start=1):
+            name = Path(fpath).name
             if progress_callback:
-                progress_callback(f"[{idx}/{len(file_data)}] Parsing uploaded file: {name} (size ~{len(text):,} chars)")
-            n_lines, _, counters = _ingest_stream(
+                progress_callback(f"[{idx}/{len(file_paths)}] Parsing file: {name}")
+            n_lines, _, counters, min_ts, max_ts = _ingest_stream(
                 conn=conn,
-                text=text,
+                file_path=str(fpath),
                 tz_name=tz_name,
                 rx=rx,
                 progress_callback=progress_callback,
@@ -238,47 +251,63 @@ def ingest_uploaded_files(
             total_lines += n_lines
             for k in counters_sum:
                 counters_sum[k] += counters[k]
+
+            if min_ts and max_ts:
+                file_metadata[name] = {
+                    "path": Path(fpath),
+                    "min_timestamp": min_ts,
+                    "max_timestamp": max_ts,
+                    "size_bytes": Path(fpath).stat().st_size if Path(fpath).exists() else 0,
+                }
     else:
         if progress_callback:
-            progress_callback(f"Processing {len(file_data)} files in parallel...")
+            progress_callback(f"Processing {len(file_paths)} files in parallel...")
 
-        args = [(name, text, tz_name, idx) for idx, (name, text) in enumerate(file_data, start=1)]
+        path_map = {Path(fpath).name: Path(fpath) for fpath in file_paths}
+        args = [(str(fpath), Path(fpath).name, tz_name) for fpath in file_paths]
 
-        with Pool(min(cpu_count(), len(file_data))) as pool:
-            results = pool.map(_parse_file_to_batches, args)
+        with Pool(min(cpu_count(), len(file_paths))) as pool:
+            cur = conn.cursor()
 
-        if progress_callback:
-            progress_callback(f"Writing results to database...")
-        cur = conn.cursor()
+            for name, n_lines, counters, batches, min_ts, max_ts, size_bytes in pool.imap_unordered(_parse_file_to_batches, args):
+                if batches["miners"]:
+                    cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", batches["miners"])
+                if batches["backward"]:
+                    cur.executemany("INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)", batches["backward"])
+                if batches["loss"]:
+                    cur.executemany("INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)", batches["loss"])
+                if batches["state"]:
+                    cur.executemany("INSERT INTO state_events (miner_hotkey, layer, to_state, ts) VALUES (?, ?, ?, ?)", batches["state"])
+                if batches["optimization"]:
+                    cur.executemany("INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)", batches["optimization"])
+                if batches["resource"]:
+                    cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", batches["resource"])
+                if batches["registration"]:
+                    cur.executemany("INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)", batches["registration"])
+                if batches["exception"]:
+                    cur.executemany("INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batches["exception"])
 
-        for name, n_lines, counters, batches in results:
-            if batches["miners"]:
-                cur.executemany("INSERT OR IGNORE INTO miners (hotkey) VALUES (?)", batches["miners"])
-            if batches["backward"]:
-                cur.executemany("INSERT INTO backward_events (miner_hotkey, layer, ts, since_reset) VALUES (?, ?, ?, ?)", batches["backward"])
-            if batches["loss"]:
-                cur.executemany("INSERT INTO loss_events (miner_hotkey, layer, ts, loss, activation_id) VALUES (?, ?, ?, ?, ?)", batches["loss"])
-            if batches["state"]:
-                cur.executemany("INSERT INTO state_events (miner_hotkey, layer, to_state, ts) VALUES (?, ?, ?, ?)", batches["state"])
-            if batches["optimization"]:
-                cur.executemany("INSERT INTO optimization_events (miner_hotkey, layer, ts, step_number, backwards_count) VALUES (?, ?, ?, ?, ?)", batches["optimization"])
-            if batches["resource"]:
-                cur.executemany("INSERT INTO resource_events (miner_hotkey, layer, ts, event_type, value_gb, value_text) VALUES (?, ?, ?, ?, ?, ?)", batches["resource"])
-            if batches["registration"]:
-                cur.executemany("INSERT INTO registration_events (miner_hotkey, layer, ts, training_epoch, status) VALUES (?, ?, ?, ?, ?)", batches["registration"])
-            if batches["exception"]:
-                cur.executemany("INSERT INTO exceptions (miner_hotkey, layer, ts, ex_type, level, http_endpoint, http_code, message, message_normalized, line_number, source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batches["exception"])
+                conn.commit()
 
-            total_files += 1
-            total_lines += n_lines
-            for k in counters_sum:
-                counters_sum[k] += counters[k]
+                total_files += 1
+                total_lines += n_lines
+                for k in counters_sum:
+                    counters_sum[k] += counters[k]
 
-        conn.commit()
+                if min_ts and max_ts:
+                    file_metadata[name] = {
+                        "path": path_map.get(name, Path(name)),
+                        "min_timestamp": min_ts,
+                        "max_timestamp": max_ts,
+                        "size_bytes": size_bytes,
+                    }
+
+                if progress_callback:
+                    progress_callback(f"[{total_files}/{len(file_paths)}] Completed: {name}")
 
     if progress_callback:
-        progress_callback(f"Done. Parsed {total_files} uploaded file(s), processed ~{total_lines:,} line(s).")
-    return total_files, total_lines, counters_sum
+        progress_callback(f"Done. Parsed {total_files} file(s), processed ~{total_lines:,} line(s).")
+    return total_files, total_lines, counters_sum, file_metadata
 
 
 BATCH_SQL = {
@@ -309,12 +338,12 @@ def _flush_batches(cur, miners_batch, backward_batch, loss_batch, state_batch,
 
 def _ingest_stream(
     conn: sqlite3.Connection,
-    text: str,
+    file_path: str,
     tz_name: str,
     rx: "._RegexBundle",
     progress_callback: Optional[Callable[[str], None]],
     source_file: str = "",
-) -> Tuple[int, int, dict]:
+) -> Tuple[int, int, dict, object, object]:
     BATCH_SIZE = 1000
     batches = {
         "miners": [], "backward": [], "loss": [], "state": [],
@@ -323,14 +352,22 @@ def _ingest_stream(
 
     counters = {}
     n_lines = 0
+    min_ts = None
+    max_ts = None
     cur = conn.cursor()
 
-    for event_type, event_data in _process_log_lines(text, tz_name, rx, source_file):
+    for event_type, event_data in _process_log_lines(file_path, tz_name, rx, source_file):
         if event_type == "counters":
             counters = event_data
             continue
         elif event_type == "lines":
             n_lines = event_data
+            continue
+        elif event_type == "min_ts":
+            min_ts = event_data
+            continue
+        elif event_type == "max_ts":
+            max_ts = event_data
             continue
 
         batch_key = "miners" if event_type == "miner" else event_type
@@ -343,7 +380,7 @@ def _ingest_stream(
     _flush_batches(cur, batches["miners"], batches["backward"], batches["loss"], batches["state"],
                    batches["optimization"], batches["resource"], batches["registration"], batches["exception"])
     conn.commit()
-    return n_lines, 0, counters
+    return n_lines, 0, counters, min_ts, max_ts
 
 
 def _extract_hotkey(rx: "._RegexBundle", line: str, msg: str) -> Optional[str]:

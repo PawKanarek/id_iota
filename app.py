@@ -15,11 +15,9 @@ import html
 from typing import List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from datetime import datetime
-from multiprocessing import Pool, cpu_count
 
 import pandas as pd
 import plotly.graph_objects as go
-from bisect import bisect_left
 from minerlogs.timeutil import parse_log_datetime
 
 APP_TITLE = "ID_IOTA — Interactive Diagnostic for IOTA"
@@ -101,9 +99,6 @@ SCROLL_SCRIPT = '''
     });
     </script>'''
 
-def _ts_key(dt) -> tuple[int, int, int, int, int, int, int]:
-    return (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.microsecond)
-
 def _load_file_lines(filepath: Path) -> List[str]:
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -111,135 +106,28 @@ def _load_file_lines(filepath: Path) -> List[str]:
     except Exception:
         return []
 
-def _build_single_header_index(fpath: Path) -> Dict[str, Any]:
-    lines = _load_file_lines(fpath)
-    keys, levels, line_idx = [], [], []
-    for i, line in enumerate(lines):
-        m = HEADER_RX.match(line)
-        if not m:
-            continue
-        dt = parse_log_datetime(m.group("dt"))
-        if dt is None:
-            continue
-        keys.append(_ts_key(dt))
-        levels.append(m.group("level"))
-        line_idx.append(i)
-    return {
-        "name": fpath.name,
-        "path": fpath,
-        "keys": keys,
-        "levels": levels,
-        "line_idx": line_idx,
-    }
-
-def _build_header_indices(file_paths: List[Path]) -> List[Dict[str, Any]]:
-    if len(file_paths) <= 4:
-        return [_build_single_header_index(fpath) for fpath in file_paths]
-
-    with Pool(min(cpu_count(), len(file_paths))) as pool:
-        idx_list = pool.map(_build_single_header_index, file_paths)
-    return idx_list
-
 def _find_exception_line_and_context(
-    ts_local: pd.Timestamp,
-    level: str,
-    message: str,
+    source_file: str,
+    line_number: int,
     file_paths: List[Path],
     pre_lines: int = 100,
     post_lines: int = 25,
 ) -> Tuple[Optional[str], List[str], List[str], Optional[int]]:
-    idx_pack = st.session_state.get("report_index", [])
-    key = _ts_key(ts_local.to_pydatetime())
+    file_path = _match_source_file_to_path(source_file, file_paths)
+    if not file_path or not file_path.exists():
+        return None, [], [], None
 
-    msg_parts = []
-    if message:
-        msg_clean = message.strip()
-        if len(msg_clean) > 20:
-            msg_parts.append(msg_clean[:40])
-        if len(msg_clean) > 80:
-            msg_parts.append(msg_clean[40:80])
-        if len(msg_clean) <= 20:
-            msg_parts.append(msg_clean)
+    lines = _load_file_lines(file_path)
+    if not lines or line_number <= 0 or line_number > len(lines):
+        return None, [], [], None
 
-    for idxf in idx_pack:
-        keys = idxf["keys"]
-        if not keys:
-            continue
-        pos = bisect_left(keys, key)
-        start = max(0, pos - 5)
-        stop = min(len(keys), pos + 6)
+    line_idx = line_number - 1
+    s = max(0, line_idx - pre_lines)
+    e = min(len(lines), line_idx + 1 + post_lines)
 
-        best_match = None
-        best_score = 0
-
-        for j in range(start, stop):
-            if keys[j] != key or idxf["levels"][j] != level:
-                continue
-
-            lines = _load_file_lines(idxf["path"])
-            if not lines:
-                continue
-
-            li = idxf["line_idx"][j]
-            line = lines[li]
-
-            score = 0
-            if msg_parts:
-                for part in msg_parts:
-                    if part and part in line:
-                        score += len(part)
-
-            if score > best_score:
-                best_score = score
-                best_match = li
-            elif score == 0 and best_match is None:
-                best_match = li
-
-        if best_match is not None:
-            s = max(0, best_match - pre_lines)
-            e = min(len(lines), best_match + 1 + post_lines)
-            return idxf["name"], lines[s:best_match], lines[best_match:e], best_match + 1
-
-    return None, [], [], None
+    return file_path.name, lines[s:line_idx], lines[line_idx:e], line_number
 
 
-def _build_single_file_metadata(fpath: Path) -> Tuple[str, Optional[Dict[str, Any]]]:
-    lines = _load_file_lines(fpath)
-    timestamps = []
-    for line in lines:
-        m = HEADER_RX.match(line)
-        if not m:
-            continue
-        dt = parse_log_datetime(m.group("dt"))
-        if dt:
-            timestamps.append(dt)
-
-    if timestamps:
-        return (fpath.name, {
-            "path": fpath,
-            "min_timestamp": min(timestamps),
-            "max_timestamp": max(timestamps),
-            "size_bytes": fpath.stat().st_size if fpath.exists() else 0,
-        })
-    return (fpath.name, None)
-
-def _build_file_metadata(file_paths: List[Path]) -> Dict[str, Dict[str, Any]]:
-    if len(file_paths) <= 4:
-        metadata = {}
-        for fpath in file_paths:
-            name, meta = _build_single_file_metadata(fpath)
-            if meta:
-                metadata[name] = meta
-        return metadata
-
-    with Pool(min(cpu_count(), len(file_paths))) as pool:
-        results = pool.map(_build_single_file_metadata, file_paths)
-
-    metadata = {}
-    for name, meta in results:
-        if meta:
-            metadata[name] = meta
-    return metadata
 
 
 def _get_files_in_range(
@@ -406,28 +294,19 @@ def _clear_all_tables(conn):
 
 def _load_and_process_files(conn, uploaded_files, file_paths, progress_callback=None):
     import streamlit as st
-    from minerlogs.ingest import ingest_uploaded_files
-    from concurrent.futures import ThreadPoolExecutor
+    from minerlogs.ingest import ingest_log_files
 
     st.session_state["uploaded_file_paths"] = file_paths
-    if "report_index" in st.session_state:
-        del st.session_state["report_index"]
-
-    with st.spinner("Building metadata and indices in parallel..."):
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_metadata = executor.submit(_build_file_metadata, file_paths)
-            future_index = executor.submit(_build_header_indices, file_paths)
-
-            st.session_state["file_metadata"] = future_metadata.result()
-            st.session_state["report_index"] = future_index.result()
 
     with st.spinner("Parsing logs and writing to database..."):
-        total_files, total_lines, counters = ingest_uploaded_files(
+        total_files, total_lines, counters, file_metadata = ingest_log_files(
             conn=conn,
-            uploaded_files=uploaded_files,
+            file_paths=file_paths,
             tz_name=TZ_NAME,
             progress_callback=progress_callback,
         )
+
+    st.session_state["file_metadata"] = file_metadata
 
     st.success(f"Parsed {total_files} file(s), ~{total_lines:,} line(s).")
     st.write("**Events captured:**")
@@ -1289,45 +1168,52 @@ def render_report_section(grouped, exc_df, exc_df_raw, selected_miners, anti_dox
     total_exc = len(exc_filtered)
     prog = st.progress(0, text="Gathering context from log files…")
 
-    for idx, r in exc_filtered.reset_index(drop=True).iterrows():
-        key = (r["message_normalized"] if pd.notna(r["message_normalized"]) else "",)
-        ex_id = sig_to_exid.get(key, -1)
-        level_val = str(r.get("level", ""))
+    file_lines_cache = {}
 
-        src_name, before, after, line_num = _find_exception_line_and_context(
-            ts_local=r["ts_local"],
-            level=level_val,
-            message=str(r.get("message", "")),
-            file_paths=file_paths,
-            pre_lines=100,
-            post_lines=25,
-        )
+    for file_name, group in exc_filtered.groupby("source_file"):
+        file_path = _match_source_file_to_path(file_name, file_paths)
 
-        lines.append(f"EX_ID {ex_id}:")
-        if src_name is None:
-            lines.append("(context unavailable — header not found in logs)")
-            flat_msg = mask_text_hotkeys(str(r["message"])) if anti_doxx else str(r["message"])
-            miner_line = mask_hotkey(str(r["miner_hotkey"])) if anti_doxx else str(r["miner_hotkey"])
-            lines.append(f"{r['ts_local']} | miner={miner_line} | message={flat_msg}")
-            lines.append("")
+        if file_path and file_path.exists():
+            file_lines_cache[file_name] = _load_file_lines(file_path)
         else:
-            lines.append(f"(source: {src_name})")
-            lines.append("(...) 100 lines before exception ")
-            for ln in before:
-                lines.append(mask_text_hotkeys(ln) if anti_doxx else ln)
-            lines.append("(...) 25 lines after exception")
-            for ln in after:
-                lines.append(mask_text_hotkeys(ln) if anti_doxx else ln)
-            lines.append("=" * 8)
-            lines.append("")
+            file_lines_cache[file_name] = []
 
-        if total_exc:
-            prog.progress((idx + 1) / total_exc, text=f"Gathering context… {idx + 1}/{total_exc}")
+        for idx, r in group.iterrows():
+            key = (r["message_normalized"] if pd.notna(r["message_normalized"]) else "",)
+            ex_id = sig_to_exid.get(key, -1)
+            line_num = r.get("line_number")
+            source_file = r.get("source_file", "")
+
+            lines.append(f"EX_ID {ex_id}:")
+
+            file_lines = file_lines_cache.get(source_file, [])
+
+            if not file_lines or not line_num or line_num <= 0 or line_num > len(file_lines):
+                lines.append("(context unavailable — file or line not found)")
+                flat_msg = mask_text_hotkeys(str(r["message"])) if anti_doxx else str(r["message"])
+                miner_line = mask_hotkey(str(r["miner_hotkey"])) if anti_doxx else str(r["miner_hotkey"])
+                lines.append(f"{r['ts_local']} | miner={miner_line} | message={flat_msg}")
+                lines.append("")
+            else:
+                line_idx = line_num - 1
+                s = max(0, line_idx - 100)
+                e = min(len(file_lines), line_idx + 1 + 25)
+
+                lines.append(f"(source: {source_file}, line {line_num})")
+                lines.append("(...) 100 lines before exception ")
+                for ln in file_lines[s:line_idx]:
+                    lines.append(mask_text_hotkeys(ln) if anti_doxx else ln)
+                lines.append("(...) 25 lines after exception")
+                for ln in file_lines[line_idx:e]:
+                    lines.append(mask_text_hotkeys(ln) if anti_doxx else ln)
+                lines.append("=" * 8)
+                lines.append("")
+
+            processed_count = exc_filtered.index.get_loc(idx) + 1
+            if total_exc:
+                prog.progress(processed_count / total_exc, text=f"Gathering context… {processed_count}/{total_exc}")
 
     prog.empty()
-
-    if "report_index" in st.session_state:
-        del st.session_state["report_index"]
 
     report_text = "\n".join(lines)
 
