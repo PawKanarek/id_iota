@@ -255,8 +255,8 @@ def ingest_log_files(
             if min_ts and max_ts:
                 file_metadata[name] = {
                     "path": Path(fpath),
-                    "min_timestamp": min_ts,
-                    "max_timestamp": max_ts,
+                    "min_timestamp": min_ts.replace(tzinfo=None) if hasattr(min_ts, 'replace') else min_ts,
+                    "max_timestamp": max_ts.replace(tzinfo=None) if hasattr(max_ts, 'replace') else max_ts,
                     "size_bytes": Path(fpath).stat().st_size if Path(fpath).exists() else 0,
                 }
     else:
@@ -297,8 +297,8 @@ def ingest_log_files(
                 if min_ts and max_ts:
                     file_metadata[name] = {
                         "path": path_map.get(name, Path(name)),
-                        "min_timestamp": min_ts,
-                        "max_timestamp": max_ts,
+                        "min_timestamp": min_ts.replace(tzinfo=None) if hasattr(min_ts, 'replace') else min_ts,
+                        "max_timestamp": max_ts.replace(tzinfo=None) if hasattr(max_ts, 'replace') else max_ts,
                         "size_bytes": size_bytes,
                     }
 
